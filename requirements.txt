@@ -1,0 +1,29 @@
+# ConvNeXt-Pose 依赖
+
+# PyTorch (根据CUDA版本选择)
+torch>=1.10.0
+torchvision>=0.11.0
+
+# 图像处理
+opencv-python>=4.5.0
+Pillow>=8.0.0
+
+# 数据处理
+numpy>=1.19.0
+scipy>=1.5.0
+
+# COCO数据集
+pycocotools>=2.0.0
+
+# 模型构建
+timm>=0.5.0
+
+# 配置管理
+PyYAML>=5.4.0
+
+# 日志和可视化
+tensorboard>=2.5.0
+tqdm>=4.60.0
+
+# 可选: 分布式训练
+# horovod>=0.22.0
