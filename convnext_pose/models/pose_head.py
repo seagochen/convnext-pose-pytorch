@@ -150,7 +150,7 @@ class PoseHead(nn.Module):
         Args:
             features: backbone输出的特征图列表或单个特征图
         Returns:
-            heatmaps: (B, num_keypoints, H, W) 关键点热图
+            heatmaps: (B, num_keypoints, H, W) 关键点热图 (logits，需要外部应用sigmoid)
         """
         if self.fpn is not None:
             x = self.fpn(features)
@@ -159,6 +159,10 @@ class PoseHead(nn.Module):
 
         x = self.deconv_layers(x)
         heatmaps = self.final_layer(x)
+
+        # 注意：输出是 raw logits，不再应用 sigmoid
+        # 训练时使用 BCEWithLogitsLoss (内部包含 sigmoid)
+        # 推理时需要手动应用 sigmoid
 
         return heatmaps
 
@@ -273,7 +277,8 @@ class PAFHead(nn.Module):
             heatmap = self.heatmap_stages[stage_idx](stage_input)
 
             paf_outputs.append(paf)
-            heatmap_outputs.append(heatmap)
+            # 对 heatmap 应用 sigmoid，范围 [0, 1]
+            heatmap_outputs.append(torch.sigmoid(heatmap))
 
         return paf_outputs, heatmap_outputs
 

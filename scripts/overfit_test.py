@@ -126,8 +126,9 @@ def visualize_predictions(model, dataset, indices, output_dir, epoch, device, in
                 _, outputs = outputs
                 outputs = outputs[-1]
 
-            # 解码预测关键点
-            pred_kpts, pred_scores = decode_heatmap(outputs, stride=stride)
+            # 解码预测关键点 (模型输出是 logits，需要应用 sigmoid)
+            outputs_prob = torch.sigmoid(outputs)
+            pred_kpts, pred_scores = decode_heatmap(outputs_prob, stride=stride)
             pred_kpts = pred_kpts[0]  # (K, 2)
             pred_scores = pred_scores[0]  # (K,)
 
@@ -294,7 +295,9 @@ def main():
 
             # 计算 PCK
             with torch.no_grad():
-                pred_kpts, pred_scores = decode_heatmap(outputs, stride=stride)
+                # 模型输出是 logits，需要应用 sigmoid
+                outputs_prob = torch.sigmoid(outputs)
+                pred_kpts, pred_scores = decode_heatmap(outputs_prob, stride=stride)
                 gt_kpts = targets['keypoints'].numpy()
 
                 batch_pck = 0

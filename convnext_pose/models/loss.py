@@ -15,7 +15,55 @@ import numpy as np
 
 
 class HeatmapLoss(nn.Module):
-    """热图MSE损失
+    """热图损失 - 使用 BCE Loss with pos_weight
+
+    使用 BCEWithLogitsLoss 并通过 pos_weight 来平衡正负样本。
+    BCEWithLogitsLoss 内部包含 sigmoid，数值稳定，
+    模型输出 raw logits 即可。
+
+    Args:
+        use_target_weight: 是否使用目标权重
+        pos_weight: 正样本权重 (用于平衡正负样本，热图中正样本很少)
+    """
+    def __init__(self, use_target_weight=True, pos_weight=25.0):
+        super().__init__()
+        self.use_target_weight = use_target_weight
+        # pos_weight 用于给正样本更高权重
+        # 热图中约 1% 是前景，所以使用 ~25 的权重
+        self.register_buffer('pos_weight', torch.tensor([pos_weight]))
+
+    def forward(self, pred, target, target_weight=None):
+        """
+        Args:
+            pred: 预测热图 logits (B, K, H, W)
+            target: 目标热图 (B, K, H, W), 值域 [0, 1]
+            target_weight: 关键点权重 (B, K) 或 (B, K, 1, 1)
+        Returns:
+            loss: 标量损失值
+        """
+        # BCE Loss with pos_weight
+        loss = F.binary_cross_entropy_with_logits(
+            pred, target,
+            pos_weight=self.pos_weight.to(pred.device),
+            reduction='none'
+        )
+
+        if self.use_target_weight and target_weight is not None:
+            if target_weight.dim() == 2:
+                target_weight = target_weight.unsqueeze(-1).unsqueeze(-1)
+            loss = loss * target_weight
+
+        # 平均损失
+        loss = loss.mean()
+
+        return loss
+
+
+# 保留原始 MSE 版本供参考
+class HeatmapMSELoss(nn.Module):
+    """热图MSE损失 (原始版本，已弃用)
+
+    问题：MSE 对前景/背景不平衡敏感，容易导致热图回归塌陷
 
     Args:
         use_target_weight: 是否使用目标权重
