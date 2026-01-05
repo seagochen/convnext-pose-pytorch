@@ -5,7 +5,6 @@
 """
 
 import os
-import time
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -15,6 +14,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
 
 from ..models import ConvNeXtPose, HeatmapLoss, PAFLoss, build_loss
 from ..utils.data import YOLOPoseDataset, build_dataloader
@@ -228,7 +228,7 @@ class Trainer:
         """恢复训练"""
         self.logger.info(f"Resuming from {checkpoint_path}")
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
         self.model.load_state_dict(checkpoint['model'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
@@ -245,7 +245,7 @@ class Trainer:
         """加载权重"""
         self.logger.info(f"Loading weights from {weights_path}")
 
-        checkpoint = torch.load(weights_path, map_location=self.device)
+        checkpoint = torch.load(weights_path, map_location=self.device, weights_only=False)
 
         if 'model' in checkpoint:
             self.model.load_state_dict(checkpoint['model'])
@@ -256,13 +256,20 @@ class Trainer:
         """训练一个 epoch"""
         self.model.train()
         train_cfg = self.config['training']
-        output_cfg = self.config['output']
 
         total_loss = 0
         num_batches = len(self.train_loader)
-        start_time = time.time()
 
-        for step, (images, targets) in enumerate(self.train_loader):
+        # 使用 tqdm 显示进度
+        pbar = tqdm(
+            self.train_loader,
+            desc=f"Epoch {epoch+1}/{train_cfg['epochs']}",
+            unit='batch',
+            ncols=120,
+            leave=True
+        )
+
+        for step, (images, targets) in enumerate(pbar):
             images = images.to(self.device)
             heatmaps = targets['heatmap'].to(self.device)
             target_weight = targets.get('target_weight')
@@ -305,21 +312,24 @@ class Trainer:
             total_loss += loss.item()
             self.global_step += 1
 
-            # 日志
-            if (step + 1) % output_cfg['log_interval'] == 0:
-                avg_loss = total_loss / (step + 1)
-                current_lr = self.optimizer.param_groups[0]['lr']
-                elapsed = time.time() - start_time
-                eta = elapsed / (step + 1) * (num_batches - step - 1)
+            # 更新进度条
+            avg_loss = total_loss / (step + 1)
+            current_lr = self.optimizer.param_groups[0]['lr']
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'avg': f'{avg_loss:.4f}',
+                'lr': f'{current_lr:.6f}'
+            })
 
-                self.logger.info(
-                    f'Epoch [{epoch+1}/{train_cfg["epochs"]}] '
-                    f'Step [{step+1}/{num_batches}] '
-                    f'Loss: {loss.item():.4f} (Avg: {avg_loss:.4f}) '
-                    f'LR: {current_lr:.6f} ETA: {eta/60:.1f}min'
-                )
+        # Epoch 结束后记录日志
+        avg_loss = total_loss / num_batches
+        self.logger.info(
+            f'Epoch [{epoch+1}/{train_cfg["epochs"]}] '
+            f'Train Loss: {avg_loss:.4f} '
+            f'LR: {self.optimizer.param_groups[0]["lr"]:.6f}'
+        )
 
-        return total_loss / num_batches
+        return avg_loss
 
     @torch.no_grad()
     def validate(self, epoch: int) -> Dict[str, float]:
@@ -334,7 +344,16 @@ class Trainer:
         output_size = self.config['data']['output_size']
         stride = input_size[0] // output_size[0]
 
-        for images, targets in self.val_loader:
+        # 使用 tqdm 显示验证进度
+        pbar = tqdm(
+            self.val_loader,
+            desc="Validating",
+            unit='batch',
+            ncols=120,
+            leave=False
+        )
+
+        for images, targets in pbar:
             images = images.to(self.device)
             heatmaps = targets['heatmap'].to(self.device)
 

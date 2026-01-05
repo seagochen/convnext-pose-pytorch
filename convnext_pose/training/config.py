@@ -5,6 +5,7 @@
 """
 
 import argparse
+from pathlib import Path
 from typing import Dict, Any, List
 
 
@@ -105,7 +106,7 @@ def get_parser() -> argparse.ArgumentParser:
     # 恢复和加载
     resume_group = parser.add_argument_group('Resume')
     resume_group.add_argument('--resume', type=str, default=None,
-                             help='恢复训练的检查点路径')
+                             help='恢复训练: 实验名称(如exp)或检查点路径')
     resume_group.add_argument('--weights', type=str, default=None,
                              help='加载模型权重 (不恢复优化器状态)')
 
@@ -121,6 +122,46 @@ def get_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_resume_path(resume: str, output_dir: str, project: str) -> str:
+    """解析恢复训练路径
+
+    支持以下格式:
+    - 实验名称: "exp" -> ./runs/train/convnext-pose/exp/weights/last.pt
+    - 完整路径: "/path/to/checkpoint.pt"
+
+    Args:
+        resume: 用户输入的恢复路径或实验名称
+        output_dir: 输出目录
+        project: 项目名称
+
+    Returns:
+        解析后的完整检查点路径
+    """
+    resume_path = Path(resume)
+
+    # 如果是完整路径且存在，直接返回
+    if resume_path.is_file():
+        return str(resume_path)
+
+    # 如果是 .pt 文件路径但不存在，报错
+    if resume.endswith('.pt'):
+        return resume  # 让后续代码报错
+
+    # 尝试作为实验名称解析
+    # 格式: output_dir/project/exp_name/weights/last.pt
+    exp_checkpoint = Path(output_dir) / project / resume / 'weights' / 'last.pt'
+    if exp_checkpoint.is_file():
+        return str(exp_checkpoint)
+
+    # 如果找不到 last.pt，尝试 best.pt
+    exp_best = Path(output_dir) / project / resume / 'weights' / 'best.pt'
+    if exp_best.is_file():
+        return str(exp_best)
+
+    # 都找不到，返回原始输入让后续报错
+    return resume
+
+
 def build_config(args: argparse.Namespace) -> Dict[str, Any]:
     """从命令行参数构建配置字典
 
@@ -130,6 +171,11 @@ def build_config(args: argparse.Namespace) -> Dict[str, Any]:
     Returns:
         配置字典
     """
+    # 解析 resume 路径
+    resume_path = None
+    if args.resume:
+        resume_path = resolve_resume_path(args.resume, args.output_dir, args.project)
+
     config = {
         # 数据配置
         'data': {
@@ -175,7 +221,7 @@ def build_config(args: argparse.Namespace) -> Dict[str, Any]:
         },
 
         # 其他
-        'resume': args.resume,
+        'resume': resume_path,
         'weights': args.weights,
         'seed': args.seed,
         'device': args.device,

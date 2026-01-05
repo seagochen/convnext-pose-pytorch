@@ -37,12 +37,8 @@ def main():
     # 构建配置
     config = build_config(args)
 
-    # 创建训练器
+    # 创建训练器 (resume 在 Trainer.__init__ 中处理)
     trainer = Trainer(config)
-
-    # 恢复训练
-    if args.resume:
-        trainer.load_checkpoint(args.resume)
 
     # 开始训练
     trainer.train()
