@@ -239,6 +239,9 @@ class Trainer:
         if self.ema and 'ema' in checkpoint:
             self.ema.load_state_dict(checkpoint['ema'])
 
+        if self.scaler and 'scaler' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler'])
+
         self.logger.info(f"Resumed from epoch {self.start_epoch}")
 
     def _load_weights(self, weights_path: str):
@@ -400,6 +403,9 @@ class Trainer:
 
         if self.ema:
             checkpoint['ema'] = self.ema.state_dict()
+
+        if self.scaler:
+            checkpoint['scaler'] = self.scaler.state_dict()
 
         # 保存最新
         torch.save(checkpoint, self.output_dir / 'weights' / 'last.pt')
