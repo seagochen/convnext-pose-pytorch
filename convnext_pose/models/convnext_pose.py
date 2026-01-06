@@ -1,41 +1,43 @@
 """
-ConvNeXt-Pose: 基于ConvNeXt的姿态检测模型
+ConvNeXt-Pose: 基于ConvNeXt的端到端多人姿态检测模型
 
-支持三种模式:
-1. heatmap: 热图回归 (类似SimpleBaseline, HRNet)
-2. paf: Part Affinity Fields (类似OpenPose)
-3. yolo: YOLO风格检测+关键点 (类似YOLOv8-Pose)
+使用 YOLO-Pose 风格的检测头，支持:
+- 多尺度目标检测 (bbox)
+- 关键点预测 (相对于bbox中心的偏移)
+- Anchor-free 设计 (类似 YOLOX/YOLOv8)
 """
 
 import torch
 import torch.nn as nn
+from typing import List, Tuple, Optional
 
 from .backbone import ConvNeXt, convnext_tiny, convnext_small, convnext_base, convnext_large
-from .pose_head import PoseHead, PAFHead, YOLOPoseHead
+from .pose_head import YOLOPoseHead, build_pose_head
 
 
 class ConvNeXtPose(nn.Module):
-    """ConvNeXt-Pose 姿态检测模型
+    """ConvNeXt-Pose 端到端多人姿态检测模型
 
     Args:
         backbone: ConvNeXt backbone类型 ('tiny', 'small', 'base', 'large')
         num_keypoints: 关键点数量
-        num_limbs: 肢体连接数量 (仅PAF模式使用)
-        head_type: 检测头类型 ('heatmap', 'paf', 'yolo')
+        fpn_channels: FPN 输出通道数
+        use_fpn: 是否使用 FPN
         pretrained_backbone: 是否加载预训练backbone
         out_indices: backbone输出的stage索引
+        strides: 各尺度的下采样步长
     """
     def __init__(self,
-                 backbone='tiny',
-                 num_keypoints=17,
-                 num_limbs=19,
-                 head_type='heatmap',
-                 pretrained_backbone=False,
-                 out_indices=[0, 1, 2, 3]):
+                 backbone: str = 'tiny',
+                 num_keypoints: int = 17,
+                 fpn_channels: int = 256,
+                 use_fpn: bool = True,
+                 pretrained_backbone: bool = False,
+                 out_indices: List[int] = [0, 1, 2, 3],
+                 strides: List[int] = None):
         super().__init__()
 
         self.num_keypoints = num_keypoints
-        self.head_type = head_type
 
         # 创建backbone
         backbone_fn = {
@@ -58,44 +60,55 @@ class ConvNeXtPose(nn.Module):
         # 获取backbone输出通道数
         in_channels = self.backbone.out_channels
 
-        # 创建检测头
-        if head_type == 'heatmap':
-            self.head = PoseHead(
-                in_channels=in_channels,
-                num_keypoints=num_keypoints,
-                use_fpn=True
-            )
-        elif head_type == 'paf':
-            self.head = PAFHead(
-                in_channels=in_channels,
-                num_keypoints=num_keypoints,
-                num_limbs=num_limbs,
-                num_stages=2,
-                use_fpn=True
-            )
-        elif head_type == 'yolo':
-            self.head = YOLOPoseHead(
-                in_channels=in_channels,
-                num_keypoints=num_keypoints
-            )
-        else:
-            raise ValueError(f"Unknown head_type: {head_type}. "
-                           f"Choose from ['heatmap', 'paf', 'yolo']")
+        # 默认步长
+        if strides is None:
+            strides = [8, 16, 32, 64][:len(in_channels)]
 
-    def forward(self, x):
-        """
+        # 创建 YOLO-Pose 检测头
+        self.head = YOLOPoseHead(
+            in_channels=in_channels,
+            num_keypoints=num_keypoints,
+            fpn_channels=fpn_channels,
+            use_fpn=use_fpn,
+            strides=strides
+        )
+
+        self.strides = strides
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """前向传播
+
         Args:
             x: 输入图像 (B, 3, H, W)
+
         Returns:
-            head_type='heatmap': heatmaps (B, num_keypoints, H', W')
-            head_type='paf': (paf_outputs, heatmap_outputs) 列表
-            head_type='yolo': 多尺度预测结果列表
+            outputs: 多尺度预测结果列表
+                每个元素形状: (B, H, W, num_outputs)
+                num_outputs = 4 (box) + 1 (obj) + num_keypoints * 3 (kpts)
         """
         features = self.backbone(x)
         outputs = self.head(features)
         return outputs
 
-    def load_pretrained_backbone(self, checkpoint_path):
+    def decode(self,
+               outputs: List[torch.Tensor],
+               conf_thresh: float = 0.25,
+               input_size: Tuple[int, int] = (640, 640)):
+        """解码网络输出为检测结果
+
+        Args:
+            outputs: forward() 的输出
+            conf_thresh: 置信度阈值
+            input_size: 输入图像大小 (H, W)
+
+        Returns:
+            bboxes: (N, 4) [x1, y1, x2, y2] 像素坐标
+            scores: (N,) 置信度分数
+            keypoints: (N, num_keypoints, 3) [x, y, conf] 像素坐标
+        """
+        return self.head.decode(outputs, conf_thresh, input_size)
+
+    def load_pretrained_backbone(self, checkpoint_path: str):
         """加载预训练backbone权重"""
         state_dict = torch.load(checkpoint_path, map_location='cpu')
         if 'model' in state_dict:
@@ -129,6 +142,7 @@ def create_model(config):
 
     Args:
         config: 配置字典或对象
+
     Returns:
         ConvNeXtPose模型
     """
@@ -138,10 +152,11 @@ def create_model(config):
     model = ConvNeXtPose(
         backbone=config.get('backbone', 'tiny'),
         num_keypoints=config.get('num_keypoints', 17),
-        num_limbs=config.get('num_limbs', 19),
-        head_type=config.get('head_type', 'heatmap'),
+        fpn_channels=config.get('fpn_channels', 256),
+        use_fpn=config.get('use_fpn', True),
         pretrained_backbone=config.get('pretrained_backbone', False),
-        out_indices=config.get('out_indices', [0, 1, 2, 3])
+        out_indices=config.get('out_indices', [0, 1, 2, 3]),
+        strides=config.get('strides', None)
     )
 
     # 加载预训练backbone

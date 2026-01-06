@@ -7,7 +7,7 @@ from .backbone import (
     convnext_base,
     convnext_large,
 )
-from .pose_head import PoseHead, PAFHead, YOLOPoseHead
+from .pose_head import YOLOPoseHead, FPN, build_pose_head
 from .convnext_pose import ConvNeXtPose, create_model
 from .loss import (
     HeatmapLoss,
@@ -26,9 +26,9 @@ __all__ = [
     "convnext_base",
     "convnext_large",
     # Pose heads
-    "PoseHead",
-    "PAFHead",
     "YOLOPoseHead",
+    "FPN",
+    "build_pose_head",
     # Full model
     "ConvNeXtPose",
     "create_model",

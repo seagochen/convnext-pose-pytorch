@@ -1,11 +1,11 @@
 """
-ConvNeXt-Pose: Human Pose Estimation with ConvNeXt Backbone
+ConvNeXt-Pose: End-to-End Multi-Person Pose Estimation with ConvNeXt Backbone
 
-A lightweight and efficient human pose estimation framework using
-ConvNeXt as the backbone network with support for YOLO data format.
+A lightweight and efficient multi-person pose estimation framework using
+ConvNeXt as the backbone network with YOLO-Pose style detection head.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .models import (
     ConvNeXt,
@@ -13,9 +13,11 @@ from .models import (
     convnext_small,
     convnext_base,
     convnext_large,
-    PoseHead,
-    PAFHead,
+    YOLOPoseHead,
+    FPN,
+    build_pose_head,
     ConvNeXtPose,
+    create_model,
 )
 
 __all__ = [
@@ -24,7 +26,9 @@ __all__ = [
     "convnext_small",
     "convnext_base",
     "convnext_large",
-    "PoseHead",
-    "PAFHead",
+    "YOLOPoseHead",
+    "FPN",
+    "build_pose_head",
     "ConvNeXtPose",
+    "create_model",
 ]

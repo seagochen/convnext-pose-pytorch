@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-ConvNeXt-Pose 推理脚本
+ConvNeXt-Pose YOLO 多人姿态估计推理脚本
 
 支持:
 - 单张图像推理
 - 视频推理
 - 摄像头实时推理
-- 可视化结果保存
+- 端到端多人检测
 
 用法:
     # 图像推理
@@ -34,40 +34,44 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
 from convnext_pose.models import ConvNeXtPose
-from convnext_pose.utils.metrics import decode_heatmap, decode_heatmap_dark
-from convnext_pose.utils.visualization import draw_pose, draw_heatmaps
+from convnext_pose.utils.yolo_utils import (
+    YOLOPosePredictor, letterbox, draw_pose, postprocess
+)
 
 
-class PoseEstimator:
-    """姿态估计器
+class MultiPersonPoseEstimator:
+    """多人姿态估计器
 
     Args:
         weights: 模型权重路径
         backbone: backbone类型
-        head_type: 检测头类型
         device: 运行设备
-        use_dark: 是否使用DARK解码
+        conf_thresh: 置信度阈值
+        iou_thresh: NMS IoU 阈值
+        input_size: 输入尺寸 (H, W)
     """
 
     def __init__(self,
                  weights: str,
                  backbone: str = 'tiny',
-                 head_type: str = 'heatmap',
                  num_keypoints: int = 17,
-                 input_size: tuple = (256, 192),
+                 input_size: tuple = (640, 640),
                  device: str = 'cuda',
-                 use_dark: bool = True):
+                 conf_thresh: float = 0.25,
+                 iou_thresh: float = 0.65):
 
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.input_size = input_size
-        self.use_dark = use_dark
+        self.conf_thresh = conf_thresh
+        self.iou_thresh = iou_thresh
         self.num_keypoints = num_keypoints
 
         # 构建模型
         self.model = ConvNeXtPose(
             backbone=backbone,
             num_keypoints=num_keypoints,
-            head_type=head_type
+            fpn_channels=256,
+            use_fpn=True
         )
 
         # 加载权重
@@ -80,20 +84,24 @@ class PoseEstimator:
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-        # 计算步长 (用于热图解码)
-        self.stride = input_size[0] // 64  # 假设输出是输入的 1/4
-
         print(f"Model loaded from {weights}")
         print(f"Device: {self.device}")
+        print(f"Input size: {input_size}")
+        print(f"Conf threshold: {conf_thresh}")
+        print(f"IoU threshold: {iou_thresh}")
 
     def _load_weights(self, weights: str):
         """加载模型权重"""
-        state_dict = torch.load(weights, map_location='cpu')
+        state_dict = torch.load(weights, map_location='cpu', weights_only=False)
 
         # 支持多种检查点格式
         if 'ema' in state_dict and state_dict['ema'] is not None:
             # 优先使用 EMA 权重
-            model_dict = state_dict['ema'].get('ema', state_dict['ema'])
+            ema_state = state_dict['ema']
+            if isinstance(ema_state, dict) and 'ema' in ema_state:
+                model_dict = ema_state['ema']
+            else:
+                model_dict = ema_state
         elif 'model' in state_dict:
             model_dict = state_dict['model']
         else:
@@ -101,156 +109,114 @@ class PoseEstimator:
 
         self.model.load_state_dict(model_dict)
 
-    def preprocess(self, image: np.ndarray, bbox=None):
+    def preprocess(self, image: np.ndarray):
         """图像预处理
 
         Args:
             image: 输入图像 (H, W, 3) BGR格式
-            bbox: 人物边界框 [x, y, w, h]
 
         Returns:
             input_tensor: 预处理后的tensor (1, 3, H, W)
-            meta: 元信息用于后处理
+            ratio: 缩放比例
+            pad: padding大小 (pad_w, pad_h)
         """
         orig_h, orig_w = image.shape[:2]
 
-        if bbox is not None:
-            x, y, w, h = bbox
-            # 扩展边界框
-            center_x, center_y = x + w / 2, y + h / 2
-            scale = max(w, h) * 1.25
-
-            # 裁剪区域
-            x1 = int(center_x - scale / 2)
-            y1 = int(center_y - scale / 2)
-            x2 = int(center_x + scale / 2)
-            y2 = int(center_y + scale / 2)
-
-            # 边界检查和padding
-            pad_left = max(0, -x1)
-            pad_top = max(0, -y1)
-            pad_right = max(0, x2 - orig_w)
-            pad_bottom = max(0, y2 - orig_h)
-
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(orig_w, x2)
-            y2 = min(orig_h, y2)
-
-            # 裁剪并padding
-            crop = image[y1:y2, x1:x2]
-            if pad_left or pad_top or pad_right or pad_bottom:
-                crop = cv2.copyMakeBorder(
-                    crop, pad_top, pad_bottom, pad_left, pad_right,
-                    cv2.BORDER_CONSTANT, value=(0, 0, 0)
-                )
-
-            meta = {
-                'center': np.array([center_x, center_y]),
-                'scale': scale,
-                'orig_size': (orig_h, orig_w)
-            }
-        else:
-            crop = image
-            meta = {
-                'center': np.array([orig_w / 2, orig_h / 2]),
-                'scale': max(orig_h, orig_w),
-                'orig_size': (orig_h, orig_w)
-            }
-
-        # 调整大小
-        input_img = cv2.resize(crop, (self.input_size[1], self.input_size[0]))
+        # Letterbox 缩放
+        img_resized, ratio, pad = letterbox(image, self.input_size)
 
         # BGR -> RGB, 归一化
-        input_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
-        input_img = input_img.astype(np.float32) / 255.0
-        input_img = (input_img - self.mean) / self.std
+        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        img_norm = img_rgb.astype(np.float32) / 255.0
+        img_norm = (img_norm - self.mean) / self.std
 
         # 转换为tensor
-        input_tensor = torch.from_numpy(input_img.transpose(2, 0, 1))
+        input_tensor = torch.from_numpy(img_norm.transpose(2, 0, 1))
         input_tensor = input_tensor.unsqueeze(0).to(self.device)
 
-        meta['crop_size'] = crop.shape[:2]
+        return input_tensor, ratio, pad, (orig_h, orig_w)
 
-        return input_tensor, meta
-
-    def postprocess(self, heatmaps, meta):
-        """后处理: 从热图解码关键点坐标
+    def scale_coords_back(self, coords, ratio, pad, orig_size):
+        """将坐标缩放回原图
 
         Args:
-            heatmaps: 热图 (1, K, H, W)
-            meta: 预处理元信息
+            coords: 坐标 (..., 2) 或 (..., 4)
+            ratio: 缩放比例
+            pad: padding (pad_w, pad_h)
+            orig_size: 原图大小 (H, W)
 
         Returns:
-            keypoints: 关键点坐标 (K, 3) [x, y, score]
+            缩放后的坐标
         """
-        # 解码热图
-        if self.use_dark:
-            coords, scores = decode_heatmap_dark(heatmaps, stride=self.stride)
+        coords = coords.clone() if torch.is_tensor(coords) else coords.copy()
+        pad_w, pad_h = pad
+
+        if coords.shape[-1] == 4:
+            coords[..., [0, 2]] -= pad_w
+            coords[..., [1, 3]] -= pad_h
+            coords[..., :4] /= ratio
+            # 裁剪到图像范围
+            coords[..., [0, 2]] = np.clip(coords[..., [0, 2]], 0, orig_size[1])
+            coords[..., [1, 3]] = np.clip(coords[..., [1, 3]], 0, orig_size[0])
         else:
-            coords, scores = decode_heatmap(heatmaps, stride=self.stride)
+            coords[..., 0] -= pad_w
+            coords[..., 1] -= pad_h
+            coords[..., :2] /= ratio
+            # 裁剪到图像范围
+            coords[..., 0] = np.clip(coords[..., 0], 0, orig_size[1])
+            coords[..., 1] = np.clip(coords[..., 1], 0, orig_size[0])
 
-        coords = coords[0]  # (K, 2)
-        scores = scores[0]  # (K,)
-
-        # 映射回原图坐标
-        h_ratio = meta['crop_size'][0] / self.input_size[0]
-        w_ratio = meta['crop_size'][1] / self.input_size[1]
-
-        coords[:, 0] = coords[:, 0] * w_ratio
-        coords[:, 1] = coords[:, 1] * h_ratio
-
-        # 转换到原图坐标系
-        center = meta['center']
-
-        coords[:, 0] = coords[:, 0] - meta['crop_size'][1] / 2 + center[0]
-        coords[:, 1] = coords[:, 1] - meta['crop_size'][0] / 2 + center[1]
-
-        # 组合坐标和得分
-        keypoints = np.zeros((self.num_keypoints, 3), dtype=np.float32)
-        keypoints[:, :2] = coords
-        keypoints[:, 2] = scores
-
-        return keypoints
+        return coords
 
     @torch.no_grad()
-    def predict(self, image: np.ndarray, bbox=None):
+    def predict(self, image: np.ndarray):
         """预测单张图像
 
         Args:
             image: 输入图像 (H, W, 3) BGR格式
-            bbox: 人物边界框 [x, y, w, h] (可选)
 
         Returns:
-            keypoints: 关键点 (K, 3) [x, y, score]
-            heatmaps: 热图 (K, H, W)
+            bboxes: (N, 4) [x1, y1, x2, y2]
+            scores: (N,)
+            keypoints: (N, K, 3) [x, y, conf]
         """
         # 预处理
-        input_tensor, meta = self.preprocess(image, bbox)
+        input_tensor, ratio, pad, orig_size = self.preprocess(image)
 
         # 推理
         outputs = self.model(input_tensor)
 
-        # 处理不同类型的输出
-        if isinstance(outputs, tuple):
-            # PAF模式
-            _, heatmaps = outputs
-            heatmaps = heatmaps[-1]
-        else:
-            heatmaps = outputs
+        # 解码
+        bboxes, scores, keypoints = self.model.decode(
+            outputs, self.conf_thresh, self.input_size
+        )
 
-        # 后处理
-        keypoints = self.postprocess(heatmaps, meta)
+        # 后处理 (NMS)
+        bboxes, scores, keypoints = postprocess(
+            bboxes, scores, keypoints,
+            conf_thresh=self.conf_thresh,
+            iou_thresh=self.iou_thresh
+        )
 
-        return keypoints, heatmaps[0].cpu().numpy()
+        # 转为 numpy 并缩放回原图
+        bboxes = bboxes.cpu().numpy()
+        scores = scores.cpu().numpy()
+        keypoints = keypoints.cpu().numpy()
+
+        if len(bboxes) > 0:
+            bboxes = self.scale_coords_back(bboxes, ratio, pad, orig_size)
+            keypoints[..., :2] = self.scale_coords_back(
+                keypoints[..., :2], ratio, pad, orig_size
+            )
+
+        return bboxes, scores, keypoints
 
 
-def process_image(estimator: PoseEstimator,
+def process_image(estimator: MultiPersonPoseEstimator,
                   image_path: str,
                   output_path: str = None,
                   show: bool = False,
-                  save_heatmap: bool = False,
-                  conf_thresh: float = 0.3):
+                  kpt_thresh: float = 0.3):
     """处理单张图像"""
     # 读取图像
     image = cv2.imread(image_path)
@@ -260,45 +226,35 @@ def process_image(estimator: PoseEstimator,
 
     # 推理
     start = time.time()
-    keypoints, heatmaps = estimator.predict(image)
+    bboxes, scores, keypoints = estimator.predict(image)
     elapsed = time.time() - start
 
     print(f"Image: {image_path}")
+    print(f"Detected {len(bboxes)} persons")
     print(f"Inference time: {elapsed*1000:.1f}ms")
 
-    # 过滤低置信度关键点
-    visibility = (keypoints[:, 2] > conf_thresh).astype(np.float32)
-
     # 可视化
-    vis = draw_pose(image, keypoints, visibility)
+    vis = draw_pose(image, keypoints, scores, bboxes, kpt_thresh=kpt_thresh)
 
     # 保存结果
     if output_path:
         cv2.imwrite(output_path, vis)
         print(f"Saved to {output_path}")
 
-        # 保存热图
-        if save_heatmap:
-            heatmap_vis = draw_heatmaps(heatmaps, image, alpha=0.5)
-            base, ext = os.path.splitext(output_path)
-            heatmap_path = f"{base}_heatmap{ext}"
-            cv2.imwrite(heatmap_path, heatmap_vis)
-            print(f"Saved heatmap to {heatmap_path}")
-
     # 显示
     if show:
-        cv2.imshow('Pose Estimation', vis)
+        cv2.imshow('Multi-Person Pose Estimation', vis)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
-    return keypoints
+    return bboxes, scores, keypoints
 
 
-def process_video(estimator: PoseEstimator,
+def process_video(estimator: MultiPersonPoseEstimator,
                   video_path: str,
                   output_path: str = None,
                   show: bool = True,
-                  conf_thresh: float = 0.3):
+                  kpt_thresh: float = 0.3):
     """处理视频"""
     cap = cv2.VideoCapture(video_path)
 
@@ -330,25 +286,26 @@ def process_video(estimator: PoseEstimator,
 
         # 推理
         start = time.time()
-        keypoints, _ = estimator.predict(frame)
+        bboxes, scores, keypoints = estimator.predict(frame)
         elapsed = time.time() - start
         total_time += elapsed
 
-        # 过滤低置信度
-        visibility = (keypoints[:, 2] > conf_thresh).astype(np.float32)
-
         # 可视化
-        vis = draw_pose(frame, keypoints, visibility)
+        vis = draw_pose(frame, keypoints, scores, bboxes, kpt_thresh=kpt_thresh)
 
-        # 显示FPS
+        # 显示信息
         frame_count += 1
         avg_fps = frame_count / total_time
+        num_persons = len(bboxes)
+
         cv2.putText(vis, f'FPS: {avg_fps:.1f}', (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(vis, f'Persons: {num_persons}', (10, 65),
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
         # 显示进度
         progress = frame_count / total_frames * 100
-        cv2.putText(vis, f'{frame_count}/{total_frames} ({progress:.1f}%)', (10, 60),
+        cv2.putText(vis, f'{frame_count}/{total_frames} ({progress:.1f}%)', (10, 100),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         # 保存
@@ -357,7 +314,7 @@ def process_video(estimator: PoseEstimator,
 
         # 显示
         if show:
-            cv2.imshow('Pose Estimation', vis)
+            cv2.imshow('Multi-Person Pose Estimation', vis)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
@@ -370,11 +327,11 @@ def process_video(estimator: PoseEstimator,
     print(f"Processed {frame_count} frames, Average FPS: {avg_fps:.1f}")
 
 
-def process_camera(estimator: PoseEstimator,
+def process_camera(estimator: MultiPersonPoseEstimator,
                    camera_id: int = 0,
                    output_path: str = None,
                    show: bool = True,
-                   conf_thresh: float = 0.3):
+                   kpt_thresh: float = 0.3):
     """处理摄像头"""
     cap = cv2.VideoCapture(camera_id)
 
@@ -403,23 +360,23 @@ def process_camera(estimator: PoseEstimator,
 
         # 推理
         start = time.time()
-        keypoints, _ = estimator.predict(frame)
+        bboxes, scores, keypoints = estimator.predict(frame)
         elapsed = time.time() - start
         frame_times.append(elapsed)
 
-        # 过滤低置信度
-        visibility = (keypoints[:, 2] > conf_thresh).astype(np.float32)
-
         # 可视化
-        vis = draw_pose(frame, keypoints, visibility)
+        vis = draw_pose(frame, keypoints, scores, bboxes, kpt_thresh=kpt_thresh)
 
         # 显示FPS (平滑)
         if len(frame_times) > 30:
             frame_times.pop(0)
         avg_time = np.mean(frame_times)
         fps = 1.0 / avg_time
+        num_persons = len(bboxes)
 
         cv2.putText(vis, f'FPS: {fps:.1f}', (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(vis, f'Persons: {num_persons}', (10, 65),
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
         # 保存
@@ -428,7 +385,7 @@ def process_camera(estimator: PoseEstimator,
 
         # 显示
         if show:
-            cv2.imshow('Pose Estimation', vis)
+            cv2.imshow('Multi-Person Pose Estimation', vis)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
@@ -444,10 +401,10 @@ def process_camera(estimator: PoseEstimator,
     cv2.destroyAllWindows()
 
 
-def process_directory(estimator: PoseEstimator,
+def process_directory(estimator: MultiPersonPoseEstimator,
                       source_dir: str,
                       output_dir: str = None,
-                      conf_thresh: float = 0.3,
+                      kpt_thresh: float = 0.3,
                       save_txt: bool = False):
     """批量处理目录中的图像"""
     source_path = Path(source_dir)
@@ -468,6 +425,8 @@ def process_directory(estimator: PoseEstimator,
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
+    total_persons = 0
+
     for i, img_path in enumerate(image_files):
         image = cv2.imread(str(img_path))
         if image is None:
@@ -475,31 +434,39 @@ def process_directory(estimator: PoseEstimator,
             continue
 
         # 推理
-        keypoints, _ = estimator.predict(image)
+        bboxes, scores, keypoints = estimator.predict(image)
+        total_persons += len(bboxes)
 
-        # 过滤低置信度
-        visibility = (keypoints[:, 2] > conf_thresh).astype(np.float32)
-
-        print(f"[{i+1}/{len(image_files)}] {img_path.name}")
+        print(f"[{i+1}/{len(image_files)}] {img_path.name}: {len(bboxes)} persons")
 
         # 保存可视化结果
         if output_dir:
-            vis = draw_pose(image, keypoints, visibility)
+            vis = draw_pose(image, keypoints, scores, bboxes, kpt_thresh=kpt_thresh)
             out_path = output_path / img_path.name
             cv2.imwrite(str(out_path), vis)
 
-            # 保存关键点为文本文件
+            # 保存检测结果为文本文件
             if save_txt:
                 txt_path = output_path / f"{img_path.stem}.txt"
                 with open(txt_path, 'w') as f:
-                    for kpt in keypoints:
-                        f.write(f"{kpt[0]:.2f} {kpt[1]:.2f} {kpt[2]:.4f}\n")
+                    for j in range(len(bboxes)):
+                        bbox = bboxes[j]
+                        score = scores[j]
+                        kpts = keypoints[j]
 
-    print(f"Done! Results saved to {output_dir}")
+                        # 格式: score x1 y1 x2 y2 kpt1_x kpt1_y kpt1_c ...
+                        line = f"{score:.4f} {bbox[0]:.2f} {bbox[1]:.2f} {bbox[2]:.2f} {bbox[3]:.2f}"
+                        for k in range(len(kpts)):
+                            line += f" {kpts[k, 0]:.2f} {kpts[k, 1]:.2f} {kpts[k, 2]:.4f}"
+                        f.write(line + "\n")
+
+    print(f"Done! Total persons detected: {total_persons}")
+    if output_dir:
+        print(f"Results saved to {output_dir}")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='ConvNeXt-Pose Inference')
+    parser = argparse.ArgumentParser(description='ConvNeXt-Pose YOLO Multi-Person Inference')
 
     # 模型参数
     parser.add_argument('--weights', type=str, required=True,
@@ -507,11 +474,10 @@ def parse_args():
     parser.add_argument('--backbone', type=str, default='tiny',
                        choices=['tiny', 'small', 'base', 'large'],
                        help='Backbone 类型')
-    parser.add_argument('--head-type', type=str, default='heatmap',
-                       choices=['heatmap', 'paf', 'yolo'],
-                       help='检测头类型')
-    parser.add_argument('--img-size', type=int, nargs=2, default=[256, 192],
+    parser.add_argument('--img-size', type=int, nargs=2, default=[640, 640],
                        help='输入大小 (H, W)')
+    parser.add_argument('--num-keypoints', type=int, default=17,
+                       help='关键点数量')
 
     # 输入源
     parser.add_argument('--source', type=str, default=None,
@@ -525,15 +491,15 @@ def parse_args():
     parser.add_argument('--show', action='store_true',
                        help='显示结果')
     parser.add_argument('--save-txt', action='store_true',
-                       help='保存关键点为文本文件')
-    parser.add_argument('--save-heatmap', action='store_true',
-                       help='保存热图可视化')
+                       help='保存检测结果为文本文件')
 
     # 推理选项
-    parser.add_argument('--conf-thresh', type=float, default=0.3,
-                       help='关键点置信度阈值')
-    parser.add_argument('--no-dark', action='store_true',
-                       help='不使用 DARK 解码')
+    parser.add_argument('--conf-thresh', type=float, default=0.25,
+                       help='检测置信度阈值')
+    parser.add_argument('--iou-thresh', type=float, default=0.65,
+                       help='NMS IoU 阈值')
+    parser.add_argument('--kpt-thresh', type=float, default=0.3,
+                       help='关键点可视化置信度阈值')
     parser.add_argument('--device', type=str, default='cuda',
                        help='运行设备')
 
@@ -544,13 +510,14 @@ def main():
     args = parse_args()
 
     # 创建估计器
-    estimator = PoseEstimator(
+    estimator = MultiPersonPoseEstimator(
         weights=args.weights,
         backbone=args.backbone,
-        head_type=args.head_type,
+        num_keypoints=args.num_keypoints,
         input_size=tuple(args.img_size),
         device=args.device,
-        use_dark=not args.no_dark
+        conf_thresh=args.conf_thresh,
+        iou_thresh=args.iou_thresh
     )
 
     # 处理输入
@@ -565,13 +532,12 @@ def main():
             if source.suffix.lower() in img_formats:
                 process_image(
                     estimator, str(source), args.output,
-                    show=args.show, save_heatmap=args.save_heatmap,
-                    conf_thresh=args.conf_thresh
+                    show=args.show, kpt_thresh=args.kpt_thresh
                 )
             elif source.suffix.lower() in vid_formats:
                 process_video(
                     estimator, str(source), args.output,
-                    show=args.show, conf_thresh=args.conf_thresh
+                    show=args.show, kpt_thresh=args.kpt_thresh
                 )
             else:
                 print(f"Unsupported file format: {source.suffix}")
@@ -579,7 +545,7 @@ def main():
         elif source.is_dir():
             process_directory(
                 estimator, str(source), args.output,
-                conf_thresh=args.conf_thresh, save_txt=args.save_txt
+                kpt_thresh=args.kpt_thresh, save_txt=args.save_txt
             )
         else:
             print(f"Source not found: {source}")
@@ -587,7 +553,7 @@ def main():
     elif args.camera is not None:
         process_camera(
             estimator, args.camera, args.output,
-            show=args.show, conf_thresh=args.conf_thresh
+            show=args.show, kpt_thresh=args.kpt_thresh
         )
     else:
         print("Please specify --source or --camera")

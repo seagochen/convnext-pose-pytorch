@@ -1,13 +1,19 @@
 """
-训练器类
+YOLO-Pose 多人姿态估计训练器
 
-封装训练循环逻辑
+支持:
+- 端到端多人姿态估计训练
+- 混合精度训练 (AMP)
+- 指数移动平均 (EMA)
+- 学习率预热和调度
+- 梯度累积
+- 检查点保存和恢复
 """
 
 import os
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -16,14 +22,15 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
-from ..models import ConvNeXtPose, HeatmapLoss, PAFLoss, build_loss
-from ..utils.data import YOLOPoseDataset, build_dataloader
-from ..utils.metrics import PoseEvaluator, decode_heatmap
+from ..models import ConvNeXtPose, create_model
+from ..models.yolo_loss import YOLOPoseLoss, build_yolo_loss
+from ..utils.data import YOLOPoseDataset, build_dataloader, collate_fn_yolo
 from ..utils.callbacks import build_scheduler, ModelEMA
+from ..utils.yolo_utils import YOLOPoseEvaluator, postprocess
 
 
-class Trainer:
-    """姿态估计训练器
+class YOLOPoseTrainer:
+    """YOLO-Pose 多人姿态估计训练器
 
     Args:
         config: 配置字典
@@ -52,8 +59,11 @@ class Trainer:
 
         # 训练状态
         self.start_epoch = 0
-        self.best_metric = 0
+        self.best_metric = float('inf')  # 使用损失作为指标，越小越好
         self.global_step = 0
+
+        # 输入尺寸
+        self.input_size = tuple(config['data']['input_size'])
 
         # 恢复训练
         if config.get('resume'):
@@ -70,6 +80,14 @@ class Trainer:
         name = output_cfg['name']
         output_dir = base_dir / name
 
+        # 如果恢复训练，使用原目录
+        if self.config.get('resume'):
+            resume_path = Path(self.config['resume'])
+            if resume_path.is_file():
+                # 从检查点路径推断输出目录
+                output_dir = resume_path.parent.parent
+                return output_dir
+
         # 如果存在则添加序号
         idx = 1
         while output_dir.exists():
@@ -83,8 +101,11 @@ class Trainer:
 
     def _setup_logging(self) -> logging.Logger:
         """设置日志"""
-        logger = logging.getLogger('trainer')
+        logger = logging.getLogger('yolo_trainer')
         logger.setLevel(logging.INFO)
+
+        # 清除已有的处理器
+        logger.handlers = []
 
         # 文件处理器
         fh = logging.FileHandler(self.output_dir / 'train.log')
@@ -111,7 +132,8 @@ class Trainer:
         model = ConvNeXtPose(
             backbone=model_cfg['backbone'],
             num_keypoints=model_cfg['num_keypoints'],
-            head_type=model_cfg['head_type'],
+            fpn_channels=model_cfg.get('fpn_channels', 256),
+            use_fpn=model_cfg.get('use_fpn', True),
         )
 
         # 加载预训练 backbone
@@ -126,20 +148,23 @@ class Trainer:
 
         # 打印模型信息
         params = sum(p.numel() for p in model.parameters()) / 1e6
-        self.logger.info(f"Model: ConvNeXt-{model_cfg['backbone'].upper()}-{model_cfg['head_type']}")
-        self.logger.info(f"Parameters: {params:.2f}M")
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+        self.logger.info(f"Model: ConvNeXt-{model_cfg['backbone'].upper()}-YOLOPose")
+        self.logger.info(f"Parameters: {params:.2f}M (trainable: {trainable:.2f}M)")
 
         return model
 
     def _build_criterion(self) -> nn.Module:
         """构建损失函数"""
-        loss_type = self.config['training']['loss_type']
-        head_type = self.config['model']['head_type']
+        num_keypoints = self.config['model']['num_keypoints']
 
-        if head_type == 'paf':
-            criterion = PAFLoss(num_stages=2)
-        else:
-            criterion = build_loss(loss_type)
+        criterion = build_yolo_loss(
+            num_keypoints=num_keypoints,
+            box_weight=0.5,
+            obj_weight=1.0,
+            kpt_weight=0.5,
+            strides=self.model.strides
+        )
 
         return criterion.to(self.device)
 
@@ -152,11 +177,6 @@ class Trainer:
         head_params = []
 
         for name, param in self.model.named_parameters():
-            # 注意：不要过滤 requires_grad=False 的参数！
-            # 否则解冻后这些参数不会被优化器管理，导致：
-            # 1. 梯度不会被 zero_grad() 清空
-            # 2. 参数不会被 optimizer.step() 更新
-            # 3. 梯度无限累积最终导致 NaN
             if 'backbone' in name:
                 backbone_params.append(param)
             else:
@@ -175,31 +195,50 @@ class Trainer:
 
         return optimizer
 
-    def _build_dataloaders(self):
+    def _build_dataloaders(self) -> Tuple[DataLoader, DataLoader]:
         """构建数据加载器"""
         data_cfg = self.config['data']
         train_cfg = self.config['training']
 
-        train_loader = build_dataloader(
+        # 训练数据加载器
+        train_dataset = YOLOPoseDataset(
             data_yaml=data_cfg['yaml_path'],
             split='train',
             input_size=data_cfg['input_size'],
-            output_size=data_cfg['output_size'],
-            batch_size=train_cfg['batch_size'],
-            num_workers=data_cfg['num_workers'],
+            max_persons=20,
+            augment=True
         )
 
-        val_loader = build_dataloader(
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=train_cfg['batch_size'],
+            shuffle=True,
+            num_workers=data_cfg['num_workers'],
+            pin_memory=True,
+            collate_fn=collate_fn_yolo,
+            drop_last=True
+        )
+
+        # 验证数据加载器
+        val_dataset = YOLOPoseDataset(
             data_yaml=data_cfg['yaml_path'],
             split='val',
             input_size=data_cfg['input_size'],
-            output_size=data_cfg['output_size'],
-            batch_size=train_cfg['batch_size'],
-            num_workers=data_cfg['num_workers'],
+            max_persons=20,
+            augment=False
         )
 
-        self.logger.info(f"Train samples: {len(train_loader.dataset)}")
-        self.logger.info(f"Val samples: {len(val_loader.dataset)}")
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=train_cfg['batch_size'],
+            shuffle=False,
+            num_workers=data_cfg['num_workers'],
+            pin_memory=True,
+            collate_fn=collate_fn_yolo
+        )
+
+        self.logger.info(f"Train samples: {len(train_dataset)}")
+        self.logger.info(f"Val samples: {len(val_dataset)}")
 
         return train_loader, val_loader
 
@@ -237,7 +276,8 @@ class Trainer:
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.scheduler.load_state_dict(checkpoint['scheduler'])
         self.start_epoch = checkpoint['epoch'] + 1
-        self.best_metric = checkpoint.get('best_metric', 0)
+        self.best_metric = checkpoint.get('best_metric', float('inf'))
+        self.global_step = checkpoint.get('global_step', 0)
 
         if self.ema and 'ema' in checkpoint:
             self.ema.load_state_dict(checkpoint['ema'])
@@ -258,12 +298,20 @@ class Trainer:
         else:
             self.model.load_state_dict(checkpoint)
 
-    def train_one_epoch(self, epoch: int) -> float:
-        """训练一个 epoch"""
+    def train_one_epoch(self, epoch: int) -> Dict[str, float]:
+        """训练一个 epoch
+
+        Returns:
+            losses: 各项损失的字典
+        """
         self.model.train()
         train_cfg = self.config['training']
 
         total_loss = 0
+        total_box_loss = 0
+        total_obj_loss = 0
+        total_kpt_loss = 0
+        total_num_pos = 0
         num_batches = len(self.train_loader)
 
         # 使用 tqdm 显示进度
@@ -271,16 +319,19 @@ class Trainer:
             self.train_loader,
             desc=f"Epoch {epoch+1}/{train_cfg['epochs']}",
             unit='batch',
-            ncols=120,
+            ncols=140,
             leave=True
         )
 
         for step, (images, targets) in enumerate(pbar):
             images = images.to(self.device)
-            heatmaps = targets['heatmap'].to(self.device)
-            target_weight = targets.get('target_weight')
-            if target_weight is not None:
-                target_weight = target_weight.to(self.device)
+
+            # 将 targets 移到设备
+            targets_device = {
+                'bboxes': targets['bboxes'].to(self.device),
+                'keypoints': targets['keypoints'].to(self.device),
+                'num_persons': targets['num_persons'].to(self.device)
+            }
 
             self.optimizer.zero_grad()
 
@@ -288,29 +339,21 @@ class Trainer:
             if train_cfg['amp']:
                 with autocast():
                     outputs = self.model(images)
-                    if self.config['model']['head_type'] == 'paf':
-                        _, hm_outputs = outputs
-                        loss = self.criterion(hm_outputs[-1], heatmaps, target_weight)
-                    else:
-                        loss = self.criterion(outputs, heatmaps, target_weight)
+                    loss_dict = self.criterion(outputs, targets_device, self.input_size)
+                    loss = loss_dict['loss']
 
                 self.scaler.scale(loss).backward()
-                # 梯度裁剪防止梯度爆炸
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 outputs = self.model(images)
-                if self.config['model']['head_type'] == 'paf':
-                    _, hm_outputs = outputs
-                    loss = self.criterion(hm_outputs[-1], heatmaps, target_weight)
-                else:
-                    loss = self.criterion(outputs, heatmaps, target_weight)
+                loss_dict = self.criterion(outputs, targets_device, self.input_size)
+                loss = loss_dict['loss']
 
                 loss.backward()
-                # 梯度裁剪防止梯度爆炸
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.optimizer.step()
 
             # 更新学习率
@@ -320,27 +363,43 @@ class Trainer:
             if self.ema:
                 self.ema.update(self.model)
 
+            # 累计损失
             total_loss += loss.item()
+            total_box_loss += loss_dict['box_loss'].item()
+            total_obj_loss += loss_dict['obj_loss'].item()
+            total_kpt_loss += loss_dict['kpt_loss'].item()
+            total_num_pos += loss_dict['num_pos'].item()
+
             self.global_step += 1
 
             # 更新进度条
             avg_loss = total_loss / (step + 1)
-            current_lr = self.optimizer.param_groups[0]['lr']
+            current_lr = self.optimizer.param_groups[1]['lr']  # head lr
             pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg': f'{avg_loss:.4f}',
-                'lr': f'{current_lr:.6f}'
+                'loss': f'{loss.item():.3f}',
+                'box': f'{loss_dict["box_loss"].item():.3f}',
+                'obj': f'{loss_dict["obj_loss"].item():.3f}',
+                'kpt': f'{loss_dict["kpt_loss"].item():.3f}',
+                'lr': f'{current_lr:.2e}'
             })
 
-        # Epoch 结束后记录日志
-        avg_loss = total_loss / num_batches
+        # 计算平均损失
+        losses = {
+            'loss': total_loss / num_batches,
+            'box_loss': total_box_loss / num_batches,
+            'obj_loss': total_obj_loss / num_batches,
+            'kpt_loss': total_kpt_loss / num_batches,
+            'num_pos': total_num_pos / num_batches
+        }
+
         self.logger.info(
             f'Epoch [{epoch+1}/{train_cfg["epochs"]}] '
-            f'Train Loss: {avg_loss:.4f} '
-            f'LR: {self.optimizer.param_groups[0]["lr"]:.6f}'
+            f'Loss: {losses["loss"]:.4f} '
+            f'(box: {losses["box_loss"]:.4f}, obj: {losses["obj_loss"]:.4f}, kpt: {losses["kpt_loss"]:.4f}) '
+            f'LR: {self.optimizer.param_groups[1]["lr"]:.6f}'
         )
 
-        return avg_loss
+        return losses
 
     @torch.no_grad()
     def validate(self, epoch: int) -> Dict[str, float]:
@@ -349,11 +408,17 @@ class Trainer:
         model.eval()
 
         total_loss = 0
-        evaluator = PoseEvaluator(num_keypoints=self.config['model']['num_keypoints'])
+        total_box_loss = 0
+        total_obj_loss = 0
+        total_kpt_loss = 0
+        num_batches = len(self.val_loader)
 
-        input_size = self.config['data']['input_size']
-        output_size = self.config['data']['output_size']
-        stride = input_size[0] // output_size[0]
+        # 创建评估器
+        evaluator = YOLOPoseEvaluator(
+            num_keypoints=self.config['model']['num_keypoints'],
+            iou_thresh=0.5,
+            pck_thresh=0.2
+        )
 
         # 使用 tqdm 显示验证进度
         pbar = tqdm(
@@ -366,34 +431,100 @@ class Trainer:
 
         for images, targets in pbar:
             images = images.to(self.device)
-            heatmaps = targets['heatmap'].to(self.device)
+            batch_size = images.shape[0]
+
+            targets_device = {
+                'bboxes': targets['bboxes'].to(self.device),
+                'keypoints': targets['keypoints'].to(self.device),
+                'num_persons': targets['num_persons'].to(self.device)
+            }
 
             outputs = model(images)
+            loss_dict = self.criterion(outputs, targets_device, self.input_size)
 
-            if self.config['model']['head_type'] == 'paf':
-                _, hm_outputs = outputs
-                outputs = hm_outputs[-1]
+            total_loss += loss_dict['loss'].item()
+            total_box_loss += loss_dict['box_loss'].item()
+            total_obj_loss += loss_dict['obj_loss'].item()
+            total_kpt_loss += loss_dict['kpt_loss'].item()
 
-            loss = self.criterion(outputs, heatmaps)
-            total_loss += loss.item()
+            # 转换 GT 格式并进行评估 - 逐图像处理
+            for b in range(batch_size):
+                n_persons = targets['num_persons'][b].item()
+                if n_persons == 0:
+                    continue
 
-            # 解码预测
-            pred_kpts, scores = decode_heatmap(outputs, stride=stride)
+                # 对单张图像解码预测
+                single_outputs = [out[b:b+1] for out in outputs]
+                pred_bboxes, pred_scores, pred_keypoints = model.decode(
+                    single_outputs, conf_thresh=0.25, input_size=self.input_size
+                )
 
-            # 更新评估器
-            target_kpts = targets['keypoints'].numpy()
-            evaluator.update(
-                pred_kpts,
-                target_kpts[:, :, :2],
-                visibility=target_kpts[:, :, 2]
-            )
+                # 后处理 (NMS)
+                if pred_bboxes.numel() > 0:
+                    pred_bboxes, pred_scores, pred_keypoints = postprocess(
+                        pred_bboxes, pred_scores, pred_keypoints,
+                        conf_thresh=0.25, iou_thresh=0.65
+                    )
 
-        metrics = evaluator.compute()
-        metrics['loss'] = total_loss / len(self.val_loader)
+                # GT: 从归一化坐标转换为像素坐标
+                gt_bboxes_norm = targets['bboxes'][b, :n_persons]  # (N, 4) [cx, cy, w, h]
+                gt_kpts_encoded = targets['keypoints'][b, :n_persons]  # (N, K, 3) [dx, dy, v]
+
+                # 转换 bbox 到像素坐标 [x1, y1, x2, y2]
+                img_h, img_w = self.input_size
+                bbox_cx_pixel = gt_bboxes_norm[:, 0] * img_w
+                bbox_cy_pixel = gt_bboxes_norm[:, 1] * img_h
+                bbox_w_pixel = gt_bboxes_norm[:, 2] * img_w
+                bbox_h_pixel = gt_bboxes_norm[:, 3] * img_h
+
+                gt_boxes_xyxy = torch.stack([
+                    bbox_cx_pixel - bbox_w_pixel / 2,
+                    bbox_cy_pixel - bbox_h_pixel / 2,
+                    bbox_cx_pixel + bbox_w_pixel / 2,
+                    bbox_cy_pixel + bbox_h_pixel / 2
+                ], dim=-1).cpu().numpy()
+
+                # 转换关键点到绝对坐标
+                # gt_kpts_encoded 的 xy 是相对于 bbox 尺寸的偏移 (dx, dy)
+                # 在 dataset 中: dx = (kx - cx) / w, dy = (ky - cy) / h
+                # 因此: kx = cx + dx * w, ky = cy + dy * h
+                gt_kpts_abs = gt_kpts_encoded.clone()
+                # 使用归一化的 bbox 参数
+                bbox_cx_norm = gt_bboxes_norm[:, 0:1]  # (N, 1)
+                bbox_cy_norm = gt_bboxes_norm[:, 1:2]  # (N, 1)
+                bbox_w_norm = gt_bboxes_norm[:, 2:3]   # (N, 1)
+                bbox_h_norm = gt_bboxes_norm[:, 3:4]   # (N, 1)
+                # 先转换为归一化的绝对坐标，再转换为像素坐标
+                gt_kpts_abs[:, :, 0] = (bbox_cx_norm + gt_kpts_encoded[:, :, 0] * bbox_w_norm) * img_w
+                gt_kpts_abs[:, :, 1] = (bbox_cy_norm + gt_kpts_encoded[:, :, 1] * bbox_h_norm) * img_h
+                gt_kpts_abs = gt_kpts_abs.cpu().numpy()
+
+                # 更新评估器
+                evaluator.update(
+                    pred_boxes=pred_bboxes.cpu().numpy(),
+                    pred_keypoints=pred_keypoints.cpu().numpy(),
+                    gt_boxes=gt_boxes_xyxy,
+                    gt_keypoints=gt_kpts_abs
+                )
+
+        # 计算评估指标
+        eval_metrics = evaluator.compute()
+
+        # 计算平均损失
+        metrics = {
+            'loss': total_loss / num_batches,
+            'box_loss': total_box_loss / num_batches,
+            'obj_loss': total_obj_loss / num_batches,
+            'kpt_loss': total_kpt_loss / num_batches,
+            'PCK@0.2': eval_metrics['PCK@0.2'],
+            'AP50': eval_metrics['AP50'],
+            'OKS': eval_metrics['OKS']
+        }
 
         self.logger.info(
             f'Validation - Loss: {metrics["loss"]:.4f} '
-            f'PCK@0.5: {metrics["PCK"]:.4f}'
+            f'(box: {metrics["box_loss"]:.4f}, obj: {metrics["obj_loss"]:.4f}, kpt: {metrics["kpt_loss"]:.4f}) '
+            f'| PCK@0.2: {metrics["PCK@0.2"]:.4f}, AP50: {metrics["AP50"]:.4f}, OKS: {metrics["OKS"]:.4f}'
         )
 
         return metrics
@@ -406,6 +537,7 @@ class Trainer:
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'best_metric': self.best_metric,
+            'global_step': self.global_step,
             'config': self.config,
         }
 
@@ -421,23 +553,22 @@ class Trainer:
         # 保存最佳
         if is_best:
             torch.save(checkpoint, self.output_dir / 'weights' / 'best.pt')
+            self.logger.info(f'Saved best model with loss: {self.best_metric:.4f}')
 
     def _log_config(self):
         """记录训练配置到日志"""
         self.logger.info("=" * 60)
-        self.logger.info("Training Configuration")
+        self.logger.info("YOLO-Pose Training Configuration")
         self.logger.info("=" * 60)
 
         # 数据配置
         data_cfg = self.config['data']
         self.logger.info(f"Data: {data_cfg['yaml_path']}")
         self.logger.info(f"Input size: {data_cfg['input_size']}")
-        self.logger.info(f"Output size: {data_cfg['output_size']}")
 
         # 模型配置
         model_cfg = self.config['model']
         self.logger.info(f"Backbone: {model_cfg['backbone']}")
-        self.logger.info(f"Head type: {model_cfg['head_type']}")
         self.logger.info(f"Num keypoints: {model_cfg['num_keypoints']}")
         self.logger.info(f"Pretrained: {model_cfg.get('pretrained', None)}")
 
@@ -456,7 +587,6 @@ class Trainer:
         self.logger.info(f"Freeze backbone: {train_cfg['freeze_backbone']}")
         if train_cfg['freeze_backbone']:
             self.logger.info(f"Freeze epochs: {train_cfg['freeze_epochs']}")
-        self.logger.info(f"Loss type: {train_cfg['loss_type']}")
 
         # 恢复信息
         if self.config.get('resume'):
@@ -484,17 +614,16 @@ class Trainer:
                 self.logger.info(f'Unfreezing backbone at epoch {epoch}')
 
             # 训练
-            train_loss = self.train_one_epoch(epoch)
+            train_losses = self.train_one_epoch(epoch)
 
             # 验证
             if (epoch + 1) % output_cfg['val_interval'] == 0:
                 metrics = self.validate(epoch)
 
-                # 保存最佳
-                is_best = metrics['PCK'] > self.best_metric
+                # 保存最佳 (使用总损失作为指标)
+                is_best = metrics['loss'] < self.best_metric
                 if is_best:
-                    self.best_metric = metrics['PCK']
-                    self.logger.info(f'New best PCK: {self.best_metric:.4f}')
+                    self.best_metric = metrics['loss']
 
                 self.save_checkpoint(epoch, is_best)
 
@@ -504,4 +633,8 @@ class Trainer:
 
         # 保存最终模型
         self.save_checkpoint(train_cfg['epochs'] - 1)
-        self.logger.info(f'Training completed. Best PCK: {self.best_metric:.4f}')
+        self.logger.info(f'Training completed. Best loss: {self.best_metric:.4f}')
+
+
+# 为了向后兼容，保留 Trainer 别名
+Trainer = YOLOPoseTrainer

@@ -29,12 +29,12 @@ def get_parser() -> argparse.ArgumentParser:
     data_group = parser.add_argument_group('Data')
     data_group.add_argument('--data', type=str, required=True,
                            help='YOLO 数据集配置文件路径 (dataset.yaml)')
-    data_group.add_argument('--img-size', type=int, nargs=2, default=[256, 192],
+    data_group.add_argument('--img-size', type=int, nargs=2, default=[640, 640],
                            metavar=('H', 'W'),
                            help='输入图像大小')
-    data_group.add_argument('--output-size', type=int, nargs=2, default=[64, 48],
+    data_group.add_argument('--output-size', type=int, nargs=2, default=[160, 160],
                            metavar=('H', 'W'),
-                           help='输出热图大小')
+                           help='输出热图大小 (stride=4 时)')
 
     # 模型相关
     model_group = parser.add_argument_group('Model')
