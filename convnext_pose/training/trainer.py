@@ -152,8 +152,11 @@ class Trainer:
         head_params = []
 
         for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
+            # 注意：不要过滤 requires_grad=False 的参数！
+            # 否则解冻后这些参数不会被优化器管理，导致：
+            # 1. 梯度不会被 zero_grad() 清空
+            # 2. 参数不会被 optimizer.step() 更新
+            # 3. 梯度无限累积最终导致 NaN
             if 'backbone' in name:
                 backbone_params.append(param)
             else:
@@ -292,6 +295,9 @@ class Trainer:
                         loss = self.criterion(outputs, heatmaps, target_weight)
 
                 self.scaler.scale(loss).backward()
+                # 梯度裁剪防止梯度爆炸
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
@@ -303,6 +309,8 @@ class Trainer:
                     loss = self.criterion(outputs, heatmaps, target_weight)
 
                 loss.backward()
+                # 梯度裁剪防止梯度爆炸
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
             # 更新学习率
@@ -414,10 +422,57 @@ class Trainer:
         if is_best:
             torch.save(checkpoint, self.output_dir / 'weights' / 'best.pt')
 
+    def _log_config(self):
+        """记录训练配置到日志"""
+        self.logger.info("=" * 60)
+        self.logger.info("Training Configuration")
+        self.logger.info("=" * 60)
+
+        # 数据配置
+        data_cfg = self.config['data']
+        self.logger.info(f"Data: {data_cfg['yaml_path']}")
+        self.logger.info(f"Input size: {data_cfg['input_size']}")
+        self.logger.info(f"Output size: {data_cfg['output_size']}")
+
+        # 模型配置
+        model_cfg = self.config['model']
+        self.logger.info(f"Backbone: {model_cfg['backbone']}")
+        self.logger.info(f"Head type: {model_cfg['head_type']}")
+        self.logger.info(f"Num keypoints: {model_cfg['num_keypoints']}")
+        self.logger.info(f"Pretrained: {model_cfg.get('pretrained', None)}")
+
+        # 训练配置
+        train_cfg = self.config['training']
+        self.logger.info(f"Epochs: {train_cfg['epochs']}")
+        self.logger.info(f"Batch size: {train_cfg['batch_size']}")
+        self.logger.info(f"Learning rate: {train_cfg['lr']}")
+        self.logger.info(f"Weight decay: {train_cfg['weight_decay']}")
+        self.logger.info(f"LR scheduler: {train_cfg['lr_scheduler']}")
+        self.logger.info(f"Warmup epochs: {train_cfg['warmup_epochs']}")
+        self.logger.info(f"AMP: {train_cfg['amp']}")
+        self.logger.info(f"EMA: {train_cfg['ema']}")
+        if train_cfg['ema']:
+            self.logger.info(f"EMA decay: {train_cfg['ema_decay']}")
+        self.logger.info(f"Freeze backbone: {train_cfg['freeze_backbone']}")
+        if train_cfg['freeze_backbone']:
+            self.logger.info(f"Freeze epochs: {train_cfg['freeze_epochs']}")
+        self.logger.info(f"Loss type: {train_cfg['loss_type']}")
+
+        # 恢复信息
+        if self.config.get('resume'):
+            self.logger.info(f"Resume from: {self.config['resume']}")
+        if self.config.get('weights'):
+            self.logger.info(f"Load weights: {self.config['weights']}")
+
+        self.logger.info("=" * 60)
+
     def train(self):
         """完整训练流程"""
         train_cfg = self.config['training']
         output_cfg = self.config['output']
+
+        # 记录训练配置
+        self._log_config()
 
         self.logger.info(f"Starting training for {train_cfg['epochs']} epochs")
         self.logger.info(f"Output dir: {self.output_dir}")
