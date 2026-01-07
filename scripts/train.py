@@ -8,18 +8,18 @@ ConvNeXt-Pose 训练入口脚本
 支持的参数:
     --data: YOLO 数据集配置文件 (必需)
     --backbone: tiny/small/base/large
-    --head-type: heatmap/paf/yolo
     --img-size: 输入尺寸 (H W)
     --batch-size: 批大小
     --epochs: 训练轮数
     --lr: 学习率
-    --amp: 混合精度训练
     --ema: 指数移动平均
     --output-dir: 输出目录
 """
 
 import sys
 from pathlib import Path
+
+import torch
 
 # 添加项目根目录到路径
 project_root = Path(__file__).resolve().parent.parent
@@ -32,7 +32,16 @@ from convnext_pose.training.trainer import Trainer
 def main():
     # 解析命令行参数
     parser = get_parser()
+    parser.add_argument('--debug-nan', action='store_true',
+                        help='Enable NaN detection (slower but helps debug)')
     args = parser.parse_args()
+
+    # [调试] 开启异常检测，定位 NaN 的反向传播来源
+    if args.debug_nan:
+        print("=" * 60)
+        print("[DEBUG] NaN detection enabled - training will be slower")
+        print("=" * 60)
+        torch.autograd.set_detect_anomaly(True)
 
     # 构建配置
     config = build_config(args)

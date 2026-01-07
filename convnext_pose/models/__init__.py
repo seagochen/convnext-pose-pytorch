@@ -9,14 +9,7 @@ from .backbone import (
 )
 from .pose_head import YOLOPoseHead, FPN, build_pose_head
 from .convnext_pose import ConvNeXtPose, create_model
-from .loss import (
-    HeatmapLoss,
-    JointsMSELoss,
-    PAFLoss,
-    OKSLoss,
-    AWingLoss,
-    build_loss,
-)
+from .loss import HeatmapLoss, AWingLoss
 
 __all__ = [
     # Backbone
@@ -32,11 +25,7 @@ __all__ = [
     # Full model
     "ConvNeXtPose",
     "create_model",
-    # Losses
+    # Losses (for heatmap-based single-person estimation)
     "HeatmapLoss",
-    "JointsMSELoss",
-    "PAFLoss",
-    "OKSLoss",
     "AWingLoss",
-    "build_loss",
 ]

@@ -3,10 +3,8 @@ YOLO-Pose 多人姿态估计训练器
 
 支持:
 - 端到端多人姿态估计训练
-- 混合精度训练 (AMP)
 - 指数移动平均 (EMA)
 - 学习率预热和调度
-- 梯度累积
 - 检查点保存和恢复
 """
 
@@ -19,7 +17,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from ..models import ConvNeXtPose, create_model
@@ -54,7 +51,6 @@ class YOLOPoseTrainer:
         self.scheduler = self._build_scheduler()
 
         # 可选组件
-        self.scaler = GradScaler() if config['training']['amp'] else None
         self.ema = self._build_ema() if config['training']['ema'] else None
 
         # 训练状态
@@ -282,9 +278,6 @@ class YOLOPoseTrainer:
         if self.ema and 'ema' in checkpoint:
             self.ema.load_state_dict(checkpoint['ema'])
 
-        if self.scaler and 'scaler' in checkpoint:
-            self.scaler.load_state_dict(checkpoint['scaler'])
-
         self.logger.info(f"Resumed from epoch {self.start_epoch}")
 
     def _load_weights(self, weights_path: str):
@@ -336,25 +329,29 @@ class YOLOPoseTrainer:
             self.optimizer.zero_grad()
 
             # 前向传播
-            if train_cfg['amp']:
-                with autocast():
-                    outputs = self.model(images)
-                    loss_dict = self.criterion(outputs, targets_device, self.input_size)
-                    loss = loss_dict['loss']
+            outputs = self.model(images)
+            loss_dict = self.criterion(outputs, targets_device, self.input_size)
+            loss = loss_dict['loss']
 
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                outputs = self.model(images)
-                loss_dict = self.criterion(outputs, targets_device, self.input_size)
-                loss = loss_dict['loss']
+            # 检查 loss 是否为 NaN
+            if torch.isnan(loss) or torch.isinf(loss):
+                self.logger.warning(f"[Step {step}] Loss is NaN/Inf, skipping this batch")
+                self.logger.warning(f"  box_loss: {loss_dict['box_loss'].item()}, "
+                                   f"obj_loss: {loss_dict['obj_loss'].item()}, "
+                                   f"kpt_loss: {loss_dict['kpt_loss'].item()}")
+                self.optimizer.zero_grad()
+                continue
 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-                self.optimizer.step()
+            loss.backward()
+
+            # 梯度裁剪
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                self.logger.warning(f"[Step {step}] Gradient NaN/Inf detected, skipping update")
+                self.optimizer.zero_grad()
+                continue
+
+            self.optimizer.step()
 
             # 更新学习率
             self.scheduler.step()
@@ -402,8 +399,13 @@ class YOLOPoseTrainer:
         return losses
 
     @torch.no_grad()
-    def validate(self, epoch: int) -> Dict[str, float]:
-        """验证"""
+    def validate(self, epoch: int, num_vis_samples: int = 10) -> Dict[str, float]:
+        """验证
+
+        Args:
+            epoch: 当前 epoch
+            num_vis_samples: 可视化样本数量
+        """
         model = self.ema.ema if self.ema else self.model
         model.eval()
 
@@ -419,6 +421,20 @@ class YOLOPoseTrainer:
             iou_thresh=0.5,
             pck_thresh=0.2
         )
+
+        # 可视化相关：随机选择样本索引
+        import random
+        total_samples = len(self.val_loader.dataset)
+        vis_indices = set(random.sample(range(total_samples), min(num_vis_samples, total_samples)))
+        vis_data = {
+            'images': [],
+            'pred_bboxes': [],
+            'pred_keypoints': [],
+            'pred_scores': [],
+            'gt_bboxes': [],
+            'gt_keypoints': []
+        }
+        sample_idx = 0  # 跟踪当前样本索引
 
         # 使用 tqdm 显示验证进度
         pbar = tqdm(
@@ -450,8 +466,6 @@ class YOLOPoseTrainer:
             # 转换 GT 格式并进行评估 - 逐图像处理
             for b in range(batch_size):
                 n_persons = targets['num_persons'][b].item()
-                if n_persons == 0:
-                    continue
 
                 # 对单张图像解码预测
                 single_outputs = [out[b:b+1] for out in outputs]
@@ -467,45 +481,61 @@ class YOLOPoseTrainer:
                     )
 
                 # GT: 从归一化坐标转换为像素坐标
-                gt_bboxes_norm = targets['bboxes'][b, :n_persons]  # (N, 4) [cx, cy, w, h]
-                gt_kpts_encoded = targets['keypoints'][b, :n_persons]  # (N, K, 3) [dx, dy, v]
-
-                # 转换 bbox 到像素坐标 [x1, y1, x2, y2]
                 img_h, img_w = self.input_size
-                bbox_cx_pixel = gt_bboxes_norm[:, 0] * img_w
-                bbox_cy_pixel = gt_bboxes_norm[:, 1] * img_h
-                bbox_w_pixel = gt_bboxes_norm[:, 2] * img_w
-                bbox_h_pixel = gt_bboxes_norm[:, 3] * img_h
 
-                gt_boxes_xyxy = torch.stack([
-                    bbox_cx_pixel - bbox_w_pixel / 2,
-                    bbox_cy_pixel - bbox_h_pixel / 2,
-                    bbox_cx_pixel + bbox_w_pixel / 2,
-                    bbox_cy_pixel + bbox_h_pixel / 2
-                ], dim=-1).cpu().numpy()
+                if n_persons > 0:
+                    gt_bboxes_norm = targets['bboxes'][b, :n_persons]  # (N, 4) [cx, cy, w, h]
+                    gt_kpts_encoded = targets['keypoints'][b, :n_persons]  # (N, K, 3) [dx, dy, v]
 
-                # 转换关键点到绝对坐标
-                # gt_kpts_encoded 的 xy 是相对于 bbox 尺寸的偏移 (dx, dy)
-                # 在 dataset 中: dx = (kx - cx) / w, dy = (ky - cy) / h
-                # 因此: kx = cx + dx * w, ky = cy + dy * h
-                gt_kpts_abs = gt_kpts_encoded.clone()
-                # 使用归一化的 bbox 参数
-                bbox_cx_norm = gt_bboxes_norm[:, 0:1]  # (N, 1)
-                bbox_cy_norm = gt_bboxes_norm[:, 1:2]  # (N, 1)
-                bbox_w_norm = gt_bboxes_norm[:, 2:3]   # (N, 1)
-                bbox_h_norm = gt_bboxes_norm[:, 3:4]   # (N, 1)
-                # 先转换为归一化的绝对坐标，再转换为像素坐标
-                gt_kpts_abs[:, :, 0] = (bbox_cx_norm + gt_kpts_encoded[:, :, 0] * bbox_w_norm) * img_w
-                gt_kpts_abs[:, :, 1] = (bbox_cy_norm + gt_kpts_encoded[:, :, 1] * bbox_h_norm) * img_h
-                gt_kpts_abs = gt_kpts_abs.cpu().numpy()
+                    # 转换 bbox 到像素坐标 [x1, y1, x2, y2]
+                    bbox_cx_pixel = gt_bboxes_norm[:, 0] * img_w
+                    bbox_cy_pixel = gt_bboxes_norm[:, 1] * img_h
+                    bbox_w_pixel = gt_bboxes_norm[:, 2] * img_w
+                    bbox_h_pixel = gt_bboxes_norm[:, 3] * img_h
 
-                # 更新评估器
-                evaluator.update(
-                    pred_boxes=pred_bboxes.cpu().numpy(),
-                    pred_keypoints=pred_keypoints.cpu().numpy(),
-                    gt_boxes=gt_boxes_xyxy,
-                    gt_keypoints=gt_kpts_abs
-                )
+                    gt_boxes_xyxy = torch.stack([
+                        bbox_cx_pixel - bbox_w_pixel / 2,
+                        bbox_cy_pixel - bbox_h_pixel / 2,
+                        bbox_cx_pixel + bbox_w_pixel / 2,
+                        bbox_cy_pixel + bbox_h_pixel / 2
+                    ], dim=-1).cpu().numpy()
+
+                    # 转换关键点到绝对坐标
+                    # gt_kpts_encoded 的 xy 是相对于 bbox 尺寸的偏移 (dx, dy)
+                    # 在 dataset 中: dx = (kx - cx) / w, dy = (ky - cy) / h
+                    # 因此: kx = cx + dx * w, ky = cy + dy * h
+                    gt_kpts_abs = gt_kpts_encoded.clone()
+                    # 使用归一化的 bbox 参数
+                    bbox_cx_norm = gt_bboxes_norm[:, 0:1]  # (N, 1)
+                    bbox_cy_norm = gt_bboxes_norm[:, 1:2]  # (N, 1)
+                    bbox_w_norm = gt_bboxes_norm[:, 2:3]   # (N, 1)
+                    bbox_h_norm = gt_bboxes_norm[:, 3:4]   # (N, 1)
+                    # 先转换为归一化的绝对坐标，再转换为像素坐标
+                    gt_kpts_abs[:, :, 0] = (bbox_cx_norm + gt_kpts_encoded[:, :, 0] * bbox_w_norm) * img_w
+                    gt_kpts_abs[:, :, 1] = (bbox_cy_norm + gt_kpts_encoded[:, :, 1] * bbox_h_norm) * img_h
+                    gt_kpts_abs = gt_kpts_abs.cpu().numpy()
+
+                    # 更新评估器
+                    evaluator.update(
+                        pred_boxes=pred_bboxes.cpu().numpy(),
+                        pred_keypoints=pred_keypoints.cpu().numpy(),
+                        gt_boxes=gt_boxes_xyxy,
+                        gt_keypoints=gt_kpts_abs
+                    )
+                else:
+                    gt_boxes_xyxy = None
+                    gt_kpts_abs = None
+
+                # 收集可视化数据
+                if sample_idx in vis_indices:
+                    vis_data['images'].append(images[b:b+1].cpu())
+                    vis_data['pred_bboxes'].append(pred_bboxes.cpu().numpy() if pred_bboxes.numel() > 0 else None)
+                    vis_data['pred_keypoints'].append(pred_keypoints.cpu().numpy() if pred_keypoints.numel() > 0 else None)
+                    vis_data['pred_scores'].append(pred_scores.cpu().numpy() if pred_scores.numel() > 0 else None)
+                    vis_data['gt_bboxes'].append(gt_boxes_xyxy)
+                    vis_data['gt_keypoints'].append(gt_kpts_abs)
+
+                sample_idx += 1
 
         # 计算评估指标
         eval_metrics = evaluator.compute()
@@ -527,6 +557,27 @@ class YOLOPoseTrainer:
             f'| PCK@0.2: {metrics["PCK@0.2"]:.4f}, AP50: {metrics["AP50"]:.4f}, OKS: {metrics["OKS"]:.4f}'
         )
 
+        # 保存可视化结果
+        if vis_data['images']:
+            from ..utils.visualization.plots import visualize_val_samples
+            import torch as th
+
+            # 拼接所有图像
+            all_images = th.cat(vis_data['images'], dim=0)
+
+            vis_path = self.output_dir / 'vis' / f'epoch_{epoch+1}.jpg'
+            visualize_val_samples(
+                images=all_images,
+                pred_bboxes_list=vis_data['pred_bboxes'],
+                pred_keypoints_list=vis_data['pred_keypoints'],
+                pred_scores_list=vis_data['pred_scores'],
+                gt_bboxes_list=vis_data['gt_bboxes'],
+                gt_keypoints_list=vis_data['gt_keypoints'],
+                save_path=str(vis_path),
+                max_samples=num_vis_samples
+            )
+            self.logger.info(f'Saved visualization to {vis_path}')
+
         return metrics
 
     def save_checkpoint(self, epoch: int, is_best: bool = False):
@@ -543,9 +594,6 @@ class YOLOPoseTrainer:
 
         if self.ema:
             checkpoint['ema'] = self.ema.state_dict()
-
-        if self.scaler:
-            checkpoint['scaler'] = self.scaler.state_dict()
 
         # 保存最新
         torch.save(checkpoint, self.output_dir / 'weights' / 'last.pt')
@@ -580,7 +628,6 @@ class YOLOPoseTrainer:
         self.logger.info(f"Weight decay: {train_cfg['weight_decay']}")
         self.logger.info(f"LR scheduler: {train_cfg['lr_scheduler']}")
         self.logger.info(f"Warmup epochs: {train_cfg['warmup_epochs']}")
-        self.logger.info(f"AMP: {train_cfg['amp']}")
         self.logger.info(f"EMA: {train_cfg['ema']}")
         if train_cfg['ema']:
             self.logger.info(f"EMA decay: {train_cfg['ema_decay']}")

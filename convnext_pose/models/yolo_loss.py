@@ -40,6 +40,10 @@ class CIoULoss(nn.Module):
         Returns:
             loss: CIoU 损失
         """
+        # 强制使用 float32 计算，避免 FP16 数值不稳定
+        pred = pred.float()
+        target = target.float()
+
         # 计算交集
         inter_x1 = torch.max(pred[:, 0], target[:, 0])
         inter_y1 = torch.max(pred[:, 1], target[:, 1])
@@ -50,11 +54,11 @@ class CIoULoss(nn.Module):
         inter_h = (inter_y2 - inter_y1).clamp(min=0)
         inter_area = inter_w * inter_h
 
-        # 计算并集
-        pred_w = pred[:, 2] - pred[:, 0]
-        pred_h = pred[:, 3] - pred[:, 1]
-        target_w = target[:, 2] - target[:, 0]
-        target_h = target[:, 3] - target[:, 1]
+        # 计算并集 - 确保宽高为正
+        pred_w = (pred[:, 2] - pred[:, 0]).clamp(min=self.eps)
+        pred_h = (pred[:, 3] - pred[:, 1]).clamp(min=self.eps)
+        target_w = (target[:, 2] - target[:, 0]).clamp(min=self.eps)
+        target_h = (target[:, 3] - target[:, 1]).clamp(min=self.eps)
 
         pred_area = pred_w * pred_h
         target_area = target_w * target_h
@@ -79,10 +83,10 @@ class CIoULoss(nn.Module):
 
         c2 = (enclose_x2 - enclose_x1) ** 2 + (enclose_y2 - enclose_y1) ** 2 + self.eps
 
-        # 长宽比一致性
+        # 长宽比一致性 - 使用 clamp 后的宽高，避免除零
         v = (4 / (math.pi ** 2)) * torch.pow(
-            torch.atan(target_w / (target_h + self.eps)) -
-            torch.atan(pred_w / (pred_h + self.eps)), 2
+            torch.atan(target_w / target_h) -
+            torch.atan(pred_w / pred_h), 2
         )
 
         with torch.no_grad():
@@ -104,9 +108,12 @@ class FocalLoss(nn.Module):
     FL(p) = -α(1-p)^γ * log(p)
 
     用于解决正负样本不平衡问题
+
+    注意：alpha 是正样本的权重。对于 YOLO 这种正负样本比例悬殊的任务，
+    需要给正样本更大的权重 (alpha > 0.5)
     """
 
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, eps: float = 1e-7):
+    def __init__(self, alpha: float = 0.75, gamma: float = 2.0, eps: float = 1e-7):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -202,11 +209,10 @@ class KeypointLoss(nn.Module):
             loss_dict['kpt_loss'] = zero
             return loss_dict
 
-        # 坐标损失 (SmoothL1)
-        coord_diff = pred_kpts - target_kpts  # (N, K, 2)
+        # 坐标损失 (SmoothL1) - 使用 float32 确保数值稳定
         coord_loss = F.smooth_l1_loss(
-            pred_kpts[vis_mask],
-            target_kpts[vis_mask],
+            pred_kpts[vis_mask].float(),
+            target_kpts[vis_mask].float(),
             reduction='mean',
             beta=0.1
         )
@@ -235,15 +241,22 @@ class KeypointLoss(nn.Module):
 
         OKS = Σ exp(-d²/2s²σ²) * δ(v>0) / Σ δ(v>0)
         """
+        # 强制使用 float32 计算
+        pred_kpts = pred_kpts.float()
+        target_kpts = target_kpts.float()
+        bbox_area = bbox_area.float()
+
         # 计算欧氏距离的平方
         d2 = ((pred_kpts - target_kpts) ** 2).sum(dim=-1)  # (N, K)
 
         # 归一化因子
-        s2 = bbox_area.unsqueeze(1)  # (N, 1)
+        s2 = bbox_area.unsqueeze(1).clamp(min=1.0)  # (N, 1) 确保面积不为0
         kappa = 2 * (self.sigmas ** 2).unsqueeze(0)  # (1, K)
 
-        # OKS for each keypoint
-        oks = torch.exp(-d2 / (2 * s2 * kappa + 1e-6))  # (N, K)
+        # OKS for each keypoint - 限制 exp 输入范围
+        exp_input = -d2 / (2 * s2 * kappa + 1e-6)
+        exp_input = exp_input.clamp(min=-50, max=0)  # exp 输入应该是负数，限制范围
+        oks = torch.exp(exp_input)  # (N, K)
 
         # 只考虑可见关键点
         vis_mask = target_vis > 0
@@ -266,15 +279,17 @@ class TaskAlignedAssigner(nn.Module):
     """
 
     def __init__(self,
-                 topk: int = 13,
-                 alpha: float = 1.0,
+                 topk: int = 10,
+                 alpha: float = 0.5,
                  beta: float = 6.0,
-                 eps: float = 1e-9):
+                 eps: float = 1e-9,
+                 iou_threshold: float = 0.2):
         super().__init__()
         self.topk = topk
         self.alpha = alpha
         self.beta = beta
         self.eps = eps
+        self.iou_threshold = iou_threshold
 
     @torch.no_grad()
     def forward(self,
@@ -324,7 +339,7 @@ class TaskAlignedAssigner(nn.Module):
             is_pos[gt_idx, topk_indices[gt_idx]] = True
 
         # 过滤 IoU 太低的
-        is_pos = is_pos & (ious > 0.1)
+        is_pos = is_pos & (ious > self.iou_threshold)
 
         # 如果一个 anchor 被多个 GT 选中，选择 IoU 最大的
         anchor_max_iou, anchor_gt_idx = ious.max(dim=0)
@@ -408,6 +423,25 @@ class YOLOPoseLoss(nn.Module):
         # 正负样本分配器
         self.assigner = TaskAlignedAssigner(topk=13)
 
+    def _check_nan(self, tensor: torch.Tensor, name: str, extra_info: str = "") -> bool:
+        """检查 tensor 是否包含 NaN 或 Inf，返回 True 表示有问题"""
+        has_nan = torch.isnan(tensor).any()
+        has_inf = torch.isinf(tensor).any()
+        if has_nan or has_inf:
+            print(f"\n{'='*60}")
+            print(f"[NaN/Inf DETECTED] {name}")
+            print(f"  Shape: {tensor.shape}")
+            print(f"  Has NaN: {has_nan}, Has Inf: {has_inf}")
+            valid_mask = ~torch.isnan(tensor) & ~torch.isinf(tensor)
+            if valid_mask.any():
+                print(f"  Valid Min: {tensor[valid_mask].min().item():.6f}")
+                print(f"  Valid Max: {tensor[valid_mask].max().item():.6f}")
+            if extra_info:
+                print(f"  Extra: {extra_info}")
+            print(f"{'='*60}\n")
+            return True
+        return False
+
     def forward(self,
                 outputs: List[torch.Tensor],
                 targets: Dict[str, torch.Tensor],
@@ -428,6 +462,19 @@ class YOLOPoseLoss(nn.Module):
         batch_size = outputs[0].shape[0]
         input_h, input_w = input_size
 
+        # [哨兵 1] 检查模型原始输出
+        for i, out in enumerate(outputs):
+            if self._check_nan(out, f"Model output scale {i}"):
+                # 返回一个大的损失值，让训练器可以检测并跳过这个 batch
+                nan_loss = torch.tensor(float('nan'), device=device, requires_grad=True)
+                return {
+                    'loss': nan_loss,
+                    'box_loss': nan_loss,
+                    'obj_loss': nan_loss,
+                    'kpt_loss': nan_loss,
+                    'num_pos': torch.tensor(0, device=device)
+                }
+
         # 使用 output 的 sum() * 0 确保梯度可以反向传播
         # 即使没有正样本，也保持计算图连接
         zero_loss = outputs[0].sum() * 0
@@ -440,6 +487,10 @@ class YOLOPoseLoss(nn.Module):
         for scale_idx, output in enumerate(outputs):
             B, H, W, C = output.shape
             stride = self.strides[scale_idx]
+
+            # [关键修复] 强制转换为 float32，防止 exp(10)*stride 溢出 FP16
+            # FP16 最大值约 65504，而 exp(10)*64 ≈ 1,409,664 会溢出
+            output = output.float()
 
             # 解析预测
             pred_box = output[..., :4]  # (B, H, W, 4)
@@ -467,6 +518,19 @@ class YOLOPoseLoss(nn.Module):
             pred_x2 = pred_cx + pred_w / 2
             pred_y2 = pred_cy + pred_h / 2
             pred_boxes_xyxy = torch.stack([pred_x1, pred_y1, pred_x2, pred_y2], dim=-1)
+
+            # [哨兵 2] 检查解码后的 Box
+            if self._check_nan(pred_boxes_xyxy, f"Decoded boxes scale {scale_idx}",
+                               f"pred_w range: [{pred_w.min():.2f}, {pred_w.max():.2f}]"):
+                if torch.isnan(pred_w).any() or torch.isinf(pred_w).any():
+                    print(" -> pred_w is NaN/Inf (likely exp overflow)")
+                if torch.isnan(pred_h).any() or torch.isinf(pred_h).any():
+                    print(" -> pred_h is NaN/Inf (likely exp overflow)")
+                nan_loss = torch.tensor(float('nan'), device=device, requires_grad=True)
+                return {
+                    'loss': nan_loss, 'box_loss': nan_loss, 'obj_loss': nan_loss,
+                    'kpt_loss': nan_loss, 'num_pos': torch.tensor(0, device=device)
+                }
 
             # 对每个 batch 计算损失
             for b in range(B):
@@ -526,21 +590,57 @@ class YOLOPoseLoss(nn.Module):
                     pos_gt_idx = assigned_gt_idx[pos_mask]
                     pos_gt_boxes = gt_boxes_xyxy[pos_gt_idx]
 
+                    # [哨兵 3] 检查 CIoU Loss 输入
+                    if self._check_nan(pos_pred_boxes, "CIoU pred_boxes") or \
+                       self._check_nan(pos_gt_boxes, "CIoU gt_boxes"):
+                        nan_loss = torch.tensor(float('nan'), device=device, requires_grad=True)
+                        return {
+                            'loss': nan_loss, 'box_loss': nan_loss, 'obj_loss': nan_loss,
+                            'kpt_loss': nan_loss, 'num_pos': torch.tensor(0, device=device)
+                        }
+
                     box_loss = self.box_loss(pos_pred_boxes, pos_gt_boxes)
+
+                    # [哨兵 4] 检查 CIoU Loss 输出
+                    if self._check_nan(box_loss, "CIoU Loss output"):
+                        nan_loss = torch.tensor(float('nan'), device=device, requires_grad=True)
+                        return {
+                            'loss': nan_loss, 'box_loss': nan_loss, 'obj_loss': nan_loss,
+                            'kpt_loss': nan_loss, 'num_pos': torch.tensor(0, device=device)
+                        }
+
                     total_box_loss += box_loss.mean()
 
                     # Keypoint 损失
                     pos_pred_kpts = pred_kpts_flat[pos_mask]  # (num_pos, K, 3)
                     pos_gt_kpts = gt_kpts[pos_gt_idx]          # (num_pos, K, 3)
 
-                    # 关键点坐标和可见性
-                    pred_kpts_coord = pos_pred_kpts[..., :2]   # (num_pos, K, 2)
+                    # 预测的关键点需要解码: sigmoid 后作为相对偏移
+                    # 模型输出的是 raw logits，需要 sigmoid 变成 [0,1]
+                    # 然后映射到 [-1, 1] 范围作为相对偏移 (dx, dy 相对于 bbox)
+                    # 使用 sigmoid * 2 - 1 映射到 [-1, 1]
+                    pred_kpts_coord = pos_pred_kpts[..., :2].sigmoid() * 2 - 1  # (num_pos, K, 2)
+
+                    # GT 关键点已经是相对偏移 (dx, dy)，可以直接使用
                     target_kpts_coord = pos_gt_kpts[..., :2]   # (num_pos, K, 2)
                     target_vis = pos_gt_kpts[..., 2]           # (num_pos, K)
 
-                    # bbox 面积用于 OKS
-                    pos_gt_areas = (pos_gt_boxes[:, 2] - pos_gt_boxes[:, 0]) * \
-                                   (pos_gt_boxes[:, 3] - pos_gt_boxes[:, 1])
+                    # OKS 用的面积：使用归一化面积 (因为坐标都是归一化的)
+                    # 归一化面积 = w_norm * h_norm (而不是像素面积)
+                    pos_gt_w_norm = gt_bboxes_norm[pos_gt_idx, 2]  # 归一化宽度
+                    pos_gt_h_norm = gt_bboxes_norm[pos_gt_idx, 3]  # 归一化高度
+                    # 注意：OKS 中面积用于归一化距离，这里用 1.0 作为参考
+                    # 因为 dx, dy 已经是归一化到 bbox 尺寸的，直接用 1.0
+                    pos_gt_areas = torch.ones_like(pos_gt_w_norm)
+
+                    # [哨兵 5] 检查 Keypoint Loss 输入
+                    if self._check_nan(pred_kpts_coord, "Keypoint pred_coords") or \
+                       self._check_nan(target_kpts_coord, "Keypoint target_coords"):
+                        nan_loss = torch.tensor(float('nan'), device=device, requires_grad=True)
+                        return {
+                            'loss': nan_loss, 'box_loss': nan_loss, 'obj_loss': nan_loss,
+                            'kpt_loss': nan_loss, 'num_pos': torch.tensor(0, device=device)
+                        }
 
                     kpt_loss_dict = self.kpt_loss(
                         pred_kpts_coord,
@@ -548,6 +648,15 @@ class YOLOPoseLoss(nn.Module):
                         target_vis,
                         pos_gt_areas
                     )
+
+                    # [哨兵 6] 检查 Keypoint Loss 输出
+                    if self._check_nan(kpt_loss_dict['kpt_loss'], "Keypoint Loss output"):
+                        nan_loss = torch.tensor(float('nan'), device=device, requires_grad=True)
+                        return {
+                            'loss': nan_loss, 'box_loss': nan_loss, 'obj_loss': nan_loss,
+                            'kpt_loss': nan_loss, 'num_pos': torch.tensor(0, device=device)
+                        }
+
                     total_kpt_loss += kpt_loss_dict['kpt_loss']
 
         # 归一化

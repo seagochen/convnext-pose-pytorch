@@ -140,8 +140,9 @@ class YOLOPoseHead(nn.Module):
             # 最后一层是 Conv2d
             final_conv = head[-1]
             if final_conv.bias is not None:
-                # objectness 偏置初始化为 -4.0，使初始概率接近 0.02
-                final_conv.bias.data[4] = -4.0
+                # objectness 偏置初始化为 -2.0，使初始概率接近 0.12
+                # 不宜太小，否则梯度消失；也不宜太大，否则初始误检太多
+                final_conv.bias.data[4] = -2.0
 
     def forward(self, features: List[torch.Tensor]) -> List[torch.Tensor]:
         """
@@ -225,10 +226,12 @@ class YOLOPoseHead(nn.Module):
 
             # 解码关键点
             kpts_pred = kpts_pred.view(B, H, W, self.num_keypoints, 3)
-            # dx, dy 是相对于 bbox 中心的偏移 (已经归一化到 bbox 尺寸)
-            # 转换为绝对像素坐标
-            kpts_x = cx + kpts_pred[..., 0] * w
-            kpts_y = cy + kpts_pred[..., 1] * h
+            # dx, dy 需要经过 sigmoid * 2 - 1 变换到 [-1, 1]，与训练时一致
+            # 然后乘以 bbox 的宽高得到相对于 bbox 中心的偏移像素
+            kpts_dx = kpts_pred[..., 0].sigmoid() * 2 - 1  # [-1, 1]
+            kpts_dy = kpts_pred[..., 1].sigmoid() * 2 - 1  # [-1, 1]
+            kpts_x = cx + kpts_dx * w
+            kpts_y = cy + kpts_dy * h
             kpts_conf = kpts_pred[..., 2].sigmoid()
             keypoints = torch.stack([kpts_x.squeeze(-1), kpts_y.squeeze(-1), kpts_conf], dim=-1)
 

@@ -175,31 +175,22 @@ class ConvNeXt(nn.Module):
 def convnext_tiny(pretrained=False, **kwargs):
     """ConvNeXt-Tiny: 28M params"""
     model = ConvNeXt(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], **kwargs)
-    if pretrained:
-        # TODO: 加载预训练权重
-        pass
     return model
 
 
 def convnext_small(pretrained=False, **kwargs):
     """ConvNeXt-Small: 50M params"""
     model = ConvNeXt(depths=[3, 3, 27, 3], dims=[96, 192, 384, 768], **kwargs)
-    if pretrained:
-        pass
     return model
 
 
 def convnext_base(pretrained=False, **kwargs):
     """ConvNeXt-Base: 89M params"""
     model = ConvNeXt(depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024], **kwargs)
-    if pretrained:
-        pass
     return model
 
 
 def convnext_large(pretrained=False, **kwargs):
     """ConvNeXt-Large: 198M params"""
     model = ConvNeXt(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536], **kwargs)
-    if pretrained:
-        pass
     return model

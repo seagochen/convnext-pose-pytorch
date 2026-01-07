@@ -389,6 +389,193 @@ def visualize_predictions(images: np.ndarray,
     return canvas
 
 
+def draw_bbox(image: np.ndarray,
+              bbox: np.ndarray,
+              color: Tuple[int, int, int] = (0, 255, 0),
+              thickness: int = 2,
+              label: Optional[str] = None) -> np.ndarray:
+    """绘制边界框
+
+    Args:
+        image: 输入图像
+        bbox: 边界框 [x1, y1, x2, y2]
+        color: 颜色 (BGR)
+        thickness: 线宽
+        label: 标签文字
+
+    Returns:
+        绘制后的图像
+    """
+    image = image.copy()
+    x1, y1, x2, y2 = map(int, bbox[:4])
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
+
+    if label:
+        font_scale = 0.5
+        font_thickness = 1
+        (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                               font_scale, font_thickness)
+        cv2.rectangle(image, (x1, y1 - text_h - 4), (x1 + text_w, y1), color, -1)
+        cv2.putText(image, label, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX,
+                   font_scale, (255, 255, 255), font_thickness)
+
+    return image
+
+
+def draw_multi_person_pose(image: np.ndarray,
+                           bboxes: np.ndarray,
+                           keypoints: np.ndarray,
+                           scores: Optional[np.ndarray] = None,
+                           is_gt: bool = False,
+                           draw_bbox: bool = True) -> np.ndarray:
+    """绘制多人姿态检测结果
+
+    Args:
+        image: 输入图像 (H, W, 3) BGR
+        bboxes: 边界框 (N, 4) [x1, y1, x2, y2]
+        keypoints: 关键点 (N, K, 2) 或 (N, K, 3)
+        scores: 检测分数 (N,)
+        is_gt: 是否是 GT (用于区分颜色)
+        draw_bbox: 是否绘制边界框
+
+    Returns:
+        可视化结果
+    """
+    image = image.copy()
+
+    if isinstance(bboxes, torch.Tensor):
+        bboxes = bboxes.cpu().numpy()
+    if isinstance(keypoints, torch.Tensor):
+        keypoints = keypoints.cpu().numpy()
+    if scores is not None and isinstance(scores, torch.Tensor):
+        scores = scores.cpu().numpy()
+
+    num_persons = len(bboxes)
+
+    # GT 用蓝色系，Pred 用绿色系
+    if is_gt:
+        bbox_color = (255, 100, 0)  # 蓝色
+        kpt_alpha = 0.6
+    else:
+        bbox_color = (0, 255, 100)  # 绿色
+        kpt_alpha = 1.0
+
+    for i in range(num_persons):
+        # 绘制边界框
+        if draw_bbox and bboxes is not None and len(bboxes) > i:
+            label = None
+            if scores is not None:
+                label = f'{scores[i]:.2f}'
+            x1, y1, x2, y2 = map(int, bboxes[i][:4])
+            cv2.rectangle(image, (x1, y1), (x2, y2), bbox_color, 2)
+            if label:
+                cv2.putText(image, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                           0.5, bbox_color, 1)
+
+        # 绘制关键点和骨架
+        if keypoints is not None and len(keypoints) > i:
+            kpts = keypoints[i]
+            if kpts.shape[-1] == 3:
+                vis = kpts[:, 2]
+                kpts = kpts[:, :2]
+            else:
+                vis = None
+
+            # 绘制骨架
+            image = draw_skeleton(image, kpts, vis, line_width=2)
+            # 绘制关键点
+            image = draw_keypoints(image, kpts, vis, radius=4)
+
+    return image
+
+
+def visualize_val_samples(images: torch.Tensor,
+                          pred_bboxes_list: List[np.ndarray],
+                          pred_keypoints_list: List[np.ndarray],
+                          pred_scores_list: List[np.ndarray],
+                          gt_bboxes_list: List[np.ndarray],
+                          gt_keypoints_list: List[np.ndarray],
+                          save_path: str,
+                          max_samples: int = 10) -> None:
+    """可视化验证样本的 GT 和预测结果并保存
+
+    Args:
+        images: 图像 tensor (B, 3, H, W)
+        pred_bboxes_list: 每张图的预测边界框列表
+        pred_keypoints_list: 每张图的预测关键点列表
+        pred_scores_list: 每张图的预测分数列表
+        gt_bboxes_list: 每张图的 GT 边界框列表
+        gt_keypoints_list: 每张图的 GT 关键点列表
+        save_path: 保存路径
+        max_samples: 最大样本数
+    """
+    import os
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
+
+    # 转换图像
+    if isinstance(images, torch.Tensor):
+        images = images.cpu().numpy()
+
+    # (B, 3, H, W) -> (B, H, W, 3)
+    if images.shape[1] == 3:
+        images = images.transpose(0, 2, 3, 1)
+
+    # 反归一化 (假设是 [0, 1] 归一化)
+    images = (images * 255).clip(0, 255).astype(np.uint8)
+    # RGB -> BGR for cv2
+    images = images[..., ::-1].copy()
+
+    batch_size = min(len(images), max_samples)
+    vis_list = []
+
+    for i in range(batch_size):
+        img = images[i].copy()
+        h, w = img.shape[:2]
+
+        # 创建左右对比图: 左边 GT，右边 Pred
+        canvas = np.zeros((h, w * 2 + 10, 3), dtype=np.uint8)
+        canvas[:, :w] = img.copy()
+        canvas[:, w + 10:] = img.copy()
+
+        # 左边绘制 GT
+        gt_img = img.copy()
+        if i < len(gt_bboxes_list) and gt_bboxes_list[i] is not None:
+            gt_img = draw_multi_person_pose(
+                gt_img,
+                gt_bboxes_list[i],
+                gt_keypoints_list[i],
+                is_gt=True,
+                draw_bbox=True
+            )
+        # 添加标签
+        cv2.putText(gt_img, 'GT', (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                   1.0, (255, 100, 0), 2)
+        canvas[:, :w] = gt_img
+
+        # 右边绘制预测
+        pred_img = img.copy()
+        if i < len(pred_bboxes_list) and pred_bboxes_list[i] is not None and len(pred_bboxes_list[i]) > 0:
+            pred_img = draw_multi_person_pose(
+                pred_img,
+                pred_bboxes_list[i],
+                pred_keypoints_list[i],
+                scores=pred_scores_list[i] if i < len(pred_scores_list) else None,
+                is_gt=False,
+                draw_bbox=True
+            )
+        # 添加标签
+        cv2.putText(pred_img, 'Pred', (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                   1.0, (0, 255, 100), 2)
+        canvas[:, w + 10:] = pred_img
+
+        vis_list.append(canvas)
+
+    # 垂直拼接所有样本
+    if vis_list:
+        result = np.vstack(vis_list)
+        cv2.imwrite(save_path, result)
+
+
 def save_visualization(image: np.ndarray, path: str):
     """保存可视化结果"""
     cv2.imwrite(path, image)

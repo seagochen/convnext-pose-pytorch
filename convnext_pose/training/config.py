@@ -69,8 +69,6 @@ def get_parser() -> argparse.ArgumentParser:
 
     # 高级训练选项
     adv_group = parser.add_argument_group('Advanced Training')
-    adv_group.add_argument('--amp', action='store_true',
-                          help='使用混合精度训练')
     adv_group.add_argument('--ema', action='store_true',
                           help='使用指数移动平均')
     adv_group.add_argument('--ema-decay', type=float, default=0.9999,
@@ -201,7 +199,6 @@ def build_config(args: argparse.Namespace) -> Dict[str, Any]:
             'weight_decay': args.weight_decay,
             'lr_scheduler': args.lr_scheduler,
             'warmup_epochs': args.warmup_epochs,
-            'amp': args.amp,
             'ema': args.ema,
             'ema_decay': args.ema_decay,
             'freeze_backbone': args.freeze_backbone,
@@ -245,7 +242,7 @@ def list_backbones():
     print("-" * 60)
     print("\nExample usage:")
     print("  python scripts/train.py --data dataset.yaml --backbone tiny")
-    print("  python scripts/train.py --data dataset.yaml --backbone small --amp")
+    print("  python scripts/train.py --data dataset.yaml --backbone small --ema")
 
 
 def validate_config(config: Dict[str, Any]) -> bool:
